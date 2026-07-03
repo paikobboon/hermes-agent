@@ -517,3 +517,42 @@ async def test_dispatch_exception_in_timer_flush_is_logged_not_lost(caplog):
     adapter.handle_message = _ok  # type: ignore[assignment]
     await adapter._handle_message_event(_text_event("m2", "C1", "U1", "hello"))
     assert len(adapter.handled) == 1
+
+
+def _sticker_event(msg_id: str, group_id: str, user_id: str) -> Dict[str, Any]:
+    return {
+        "type": "message",
+        "replyToken": "rt-sticker",
+        "webhookEventId": f"wh-{msg_id}",
+        "source": _group_source(group_id, user_id),
+        "message": {"type": "sticker", "id": msg_id, "keywords": ["ok"]},
+    }
+
+
+async def test_sticker_during_open_buffer_bypasses_and_preserves_it():
+    """A self-contained turn (sticker) from the same sender must dispatch
+    immediately AND leave the pending media buffer intact — the claimed
+    'never disturb' behavior."""
+    adapter = _make_adapter(
+        sender_names=False,
+        coalesce_media=True,
+        coalesce_media_grace=0.4,
+        coalesce_idle=0.4,
+        coalesce_max_age=2.0,
+    )
+    await adapter._handle_message_event(_image_event("m1", "C1", "U1"))
+    assert adapter._coalescer.has_buffer(("C1", "U1"))
+
+    await adapter._handle_message_event(_sticker_event("s1", "C1", "U1"))
+    # Sticker dispatched immediately, buffer untouched.
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].text == "[sticker: ok]"
+    assert adapter._coalescer.has_buffer(("C1", "U1"))
+
+    # Caption still merges into the surviving buffer.
+    await adapter._handle_message_event(_text_event("คือรูปแผลป๊า", "C1", "U1", "t9"))
+    await asyncio.sleep(0.9)
+    assert len(adapter.handled) == 2
+    merged = adapter.handled[1]
+    assert merged.text == "คือรูปแผลป๊า"
+    assert merged.media_urls == ["/fake/m1.jpg"]
