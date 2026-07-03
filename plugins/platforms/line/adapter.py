@@ -76,7 +76,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,16 @@ LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
 
+# Identity resolution endpoints (sender display names + group titles).
+LINE_GROUP_MEMBER_URL_FMT = (
+    "https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+)
+LINE_ROOM_MEMBER_URL_FMT = (
+    "https://api.line.me/v2/bot/room/{room_id}/member/{user_id}"
+)
+LINE_PROFILE_URL_FMT = "https://api.line.me/v2/bot/profile/{user_id}"
+LINE_GROUP_SUMMARY_URL_FMT = "https://api.line.me/v2/bot/group/{group_id}/summary"
+
 # LINE Messaging API hard limits
 LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
@@ -132,6 +142,23 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+
+# Sender/chat identity resolution
+SENDER_NAME_CACHE_TTL_SECONDS = 6 * 3600  # 6h; display names rarely change
+SENDER_NAME_HTTP_TIMEOUT_SECONDS = 10.0  # bounded — resolution must not hang dispatch
+
+# Media→text coalescing. LINE has no image captions, so a user sends an image
+# and then explains it in a follow-up text 1–5s later. Without coalescing the
+# adapter dispatches two disjoint turns and the agent answers the bare image
+# before the caption lands. A MEDIA message opens a short buffer; TEXT (and
+# further media) from the same sender merge into one MessageEvent.
+DEFAULT_COALESCE_MEDIA_GRACE = 4.0  # seconds a lone media waits for a caption
+DEFAULT_COALESCE_IDLE = 2.5         # window extension per merged message
+DEFAULT_COALESCE_MAX_AGE = 7.0      # hard cap from the first buffered event
+
+# Inbound message types that open/extend a coalescing buffer. Audio (voice
+# notes), stickers, and locations are self-contained turns — they never buffer.
+_COALESCE_MEDIA_TYPES: Set[str] = {"image", "video", "file"}
 
 # Map LINE webhook message types to the normalized MessageType the gateway
 # routes on. LINE has no separate "voice" type — audio messages are recorded
@@ -391,6 +418,209 @@ class _MessageDeduplicator:
 
 
 # ---------------------------------------------------------------------------
+# Media→text coalescing
+# ---------------------------------------------------------------------------
+
+# Signature of the callable the coalescer invokes to emit a finished turn.
+# Kept LINE-shaped but adapter-agnostic so the coalescer is unit-testable
+# without a live gateway: pass any async callable and inspect what it receives.
+CoalesceDispatch = Callable[..., Awaitable[None]]
+
+
+@dataclass
+class _CoalesceBuffer:
+    """One in-flight (chat_id, user_id) turn awaiting possible follow-ups."""
+
+    key: Tuple[str, str]
+    latest_event: Dict[str, Any]      # freshest raw event → freshest replyToken
+    message_id: str                    # id of the FIRST buffered media message
+    placeholder: str                   # original ``[image]`` text, used if no caption
+    media_urls: List[str] = field(default_factory=list)
+    media_types: List[str] = field(default_factory=list)
+    texts: List[str] = field(default_factory=list)  # real captions, newline-joined
+    created_at: float = field(default_factory=time.monotonic)
+    timer: Optional["asyncio.Task[None]"] = None
+    timer_token: int = 0               # guards against stale timer flushes
+
+
+class _MediaCoalescer:
+    """Sliding-window batcher that fuses a media message with the text that
+    explains it into a single dispatched turn.
+
+    Rules (see module patch notes):
+
+    * Only a MEDIA message opens a buffer, held ``grace`` seconds.
+    * TEXT from the same sender while a buffer is open merges in and extends
+      the window by ``idle`` (captions join with newlines).
+    * Further MEDIA from the same sender merges its urls/types and extends too.
+    * ``max_age`` from the first buffered event is a hard flush cap.
+    * TEXT with no open buffer dispatches immediately (zero added latency).
+    * A different sender or chat never merges — separate key, separate buffer.
+
+    Concurrency: a single adapter-level lock guards all buffer state (LINE
+    traffic is low, so one lock is simpler and provably correct). Timers run
+    as tasks; a per-buffer token makes a woken timer a no-op if it was
+    superseded by a merge, so we never double-flush or leak a stale flush.
+    """
+
+    def __init__(
+        self,
+        dispatch: CoalesceDispatch,
+        *,
+        grace: float,
+        idle: float,
+        max_age: float,
+    ) -> None:
+        self._dispatch = dispatch
+        self._grace = max(0.0, grace)
+        self._idle = max(0.0, idle)
+        self._max_age = max(0.0, max_age)
+        self._buffers: Dict[Tuple[str, str], _CoalesceBuffer] = {}
+        self._lock = asyncio.Lock()
+
+    def has_buffer(self, key: Tuple[str, str]) -> bool:
+        return key in self._buffers
+
+    async def submit_media(
+        self,
+        key: Tuple[str, str],
+        raw_event: Dict[str, Any],
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+        message_id: str,
+    ) -> None:
+        """Open a new buffer for a lone media message, or merge into an open one."""
+        flush_event: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            buf = self._buffers.get(key)
+            if buf is None:
+                buf = _CoalesceBuffer(
+                    key=key,
+                    latest_event=raw_event,
+                    message_id=message_id,
+                    placeholder=text,
+                    media_urls=list(media_urls),
+                    media_types=list(media_types),
+                )
+                self._buffers[key] = buf
+                # The initial grace window is still bounded by the hard cap so
+                # a grace > max_age misconfiguration can't defeat the cap.
+                self._schedule(key, min(self._grace, self._max_age))
+            else:
+                buf.media_urls.extend(media_urls)
+                buf.media_types.extend(media_types)
+                buf.latest_event = raw_event
+                flush_event = self._extend_or_flush(key)
+        if flush_event is not None:
+            await self._safe_dispatch(flush_event)
+
+    async def submit_text(
+        self,
+        key: Tuple[str, str],
+        raw_event: Dict[str, Any],
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+        message_id: str,
+    ) -> None:
+        """Merge a caption into an open buffer, or dispatch the text immediately."""
+        dispatch_kwargs: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            buf = self._buffers.get(key)
+            if buf is None:
+                # No media pending — plain text must gain zero latency.
+                dispatch_kwargs = dict(
+                    raw_event=raw_event,
+                    text=text,
+                    media_urls=list(media_urls),
+                    media_types=list(media_types),
+                    message_id=message_id,
+                )
+            else:
+                if text:
+                    buf.texts.append(text)
+                buf.latest_event = raw_event
+                dispatch_kwargs = self._extend_or_flush(key)
+        if dispatch_kwargs is not None:
+            await self._safe_dispatch(dispatch_kwargs)
+
+    async def flush_all(self) -> None:
+        """Immediately flush every pending buffer — for adapter shutdown."""
+        pending: List[Dict[str, Any]] = []
+        async with self._lock:
+            for key in list(self._buffers.keys()):
+                buf = self._buffers.pop(key)
+                self._cancel_timer(buf)
+                pending.append(self._build_flush_kwargs(buf))
+        for kwargs in pending:
+            await self._safe_dispatch(kwargs)
+
+    async def _safe_dispatch(self, kwargs: Dict[str, Any]) -> None:
+        """Dispatch outside the lock; downstream failures are logged, never
+        raised. Timer flushes run in detached tasks, where an uncaught
+        exception is a silently dropped user turn — the exact failure class
+        this patch exists to remove."""
+        try:
+            await self._dispatch(**kwargs)
+        except Exception:
+            logger.exception("LINE: coalesced dispatch failed")
+
+    # -- internals (all callers below hold ``self._lock``) ------------------
+
+    def _extend_or_flush(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        """Reschedule the buffer's timer, or return flush kwargs if the hard
+        cap is already reached. Caller dispatches the returned kwargs outside
+        the lock."""
+        buf = self._buffers[key]
+        now = time.monotonic()
+        hard_remaining = (buf.created_at + self._max_age) - now
+        if hard_remaining <= 0:
+            self._cancel_timer(buf)
+            del self._buffers[key]
+            return self._build_flush_kwargs(buf)
+        self._schedule(key, min(self._idle, hard_remaining))
+        return None
+
+    def _schedule(self, key: Tuple[str, str], delay: float) -> None:
+        buf = self._buffers[key]
+        self._cancel_timer(buf)
+        buf.timer_token += 1
+        token = buf.timer_token
+        buf.timer = asyncio.create_task(self._flush_after(key, max(0.0, delay), token))
+
+    @staticmethod
+    def _cancel_timer(buf: _CoalesceBuffer) -> None:
+        if buf.timer is not None and not buf.timer.done():
+            buf.timer.cancel()
+        buf.timer = None
+
+    async def _flush_after(self, key: Tuple[str, str], delay: float, token: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        kwargs: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            buf = self._buffers.get(key)
+            if buf is None or buf.timer_token != token:
+                return  # superseded by a merge or already flushed
+            del self._buffers[key]
+            kwargs = self._build_flush_kwargs(buf)
+        await self._safe_dispatch(kwargs)
+
+    def _build_flush_kwargs(self, buf: _CoalesceBuffer) -> Dict[str, Any]:
+        text = "\n".join(buf.texts) if buf.texts else buf.placeholder
+        return dict(
+            raw_event=buf.latest_event,
+            text=text,
+            media_urls=list(buf.media_urls),
+            media_types=list(buf.media_types),
+            message_id=buf.message_id,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Source / chat-id resolution
 # ---------------------------------------------------------------------------
 
@@ -527,6 +757,25 @@ class _LineClient:
         except Exception:
             return None
 
+    async def get_json(
+        self, url: str, *, timeout: float = SENDER_NAME_HTTP_TIMEOUT_SECONDS
+    ) -> Optional[Dict[str, Any]]:
+        """GET a LINE JSON endpoint. Fail-open: any error/non-2xx → ``None``.
+
+        Used for identity lookups (member profiles, group summaries) where a
+        failure must degrade to the raw id rather than block message handling.
+        """
+        import aiohttp
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=client_timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    return await resp.json()
+        except Exception:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Message builders
@@ -631,6 +880,23 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _float_setting(env_name: str, extra_value: Any, default: float) -> float:
+    """Resolve a float from env, then the ``extra`` config, then ``default``.
+
+    Any unparseable value at either layer falls back to ``default`` rather
+    than raising — a bad knob must never take the adapter down.
+    """
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = extra_value
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -716,6 +982,31 @@ class LineAdapter(BasePlatformAdapter):
             or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
         )
 
+        # Sender/chat identity resolution (group chats need "who is speaking").
+        self.sender_names = _truthy_env(
+            "LINE_SENDER_NAMES", bool(extra.get("sender_names", True))
+        )
+
+        # Media→text coalescing knobs.
+        self.coalesce_media = _truthy_env(
+            "LINE_COALESCE_MEDIA", bool(extra.get("coalesce_media", True))
+        )
+        self.coalesce_media_grace = _float_setting(
+            "LINE_COALESCE_MEDIA_GRACE",
+            extra.get("coalesce_media_grace"),
+            DEFAULT_COALESCE_MEDIA_GRACE,
+        )
+        self.coalesce_idle = _float_setting(
+            "LINE_COALESCE_IDLE",
+            extra.get("coalesce_idle"),
+            DEFAULT_COALESCE_IDLE,
+        )
+        self.coalesce_max_age = _float_setting(
+            "LINE_COALESCE_MAX_AGE",
+            extra.get("coalesce_max_age"),
+            DEFAULT_COALESCE_MAX_AGE,
+        )
+
         # Runtime state
         self._client: Optional[_LineClient] = None
         self._app = None  # aiohttp.web.Application
@@ -735,6 +1026,18 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+
+        # Identity-resolution cache: key → (resolved_name, expiry). Keys are
+        # namespaced by lookup kind (member/profile/group summary).
+        self._name_cache: Dict[str, Tuple[str, float]] = {}
+
+        # Media→text coalescer. Emits finished turns through _dispatch_coalesced.
+        self._coalescer = _MediaCoalescer(
+            self._dispatch_coalesced,
+            grace=self.coalesce_media_grace,
+            idle=self.coalesce_idle,
+            max_age=self.coalesce_max_age,
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -823,6 +1126,13 @@ class LineAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
+
+        # Flush any pending coalescing buffers before teardown so a buffered
+        # media+caption turn is never silently dropped on shutdown.
+        try:
+            await self._coalescer.flush_all()
+        except Exception as exc:
+            logger.debug("LINE: coalescer flush on disconnect failed: %s", exc)
 
         if self._site is not None:
             try:
@@ -973,25 +1283,167 @@ class LineAdapter(BasePlatformAdapter):
         if chat_type == "dm" and self._client:
             asyncio.create_task(self._client.loading(chat_id))
 
+        # Route through the media→text coalescer when enabled. MEDIA opens or
+        # extends a buffer; TEXT merges into an open buffer (else dispatches
+        # immediately). Self-contained turns (sticker/location/audio/unknown)
+        # bypass the buffer entirely and never disturb a pending one.
+        if self.coalesce_media:
+            key = (chat_id, user_id)
+            if msg_type in _COALESCE_MEDIA_TYPES:
+                await self._coalescer.submit_media(
+                    key, event, text, media_urls, media_types, message_id
+                )
+                return
+            if msg_type == "text":
+                await self._coalescer.submit_text(
+                    key, event, text, media_urls, media_types, message_id
+                )
+                return
+
+        await self._dispatch_coalesced(
+            raw_event=event,
+            text=text,
+            media_urls=media_urls,
+            media_types=media_types,
+            message_id=message_id,
+        )
+
+    async def _dispatch_coalesced(
+        self,
+        *,
+        raw_event: Dict[str, Any],
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+        message_id: str,
+    ) -> None:
+        """Build the final ``MessageEvent`` (resolving sender/chat identity)
+        and hand it to the gateway. Single builder for every dispatch path —
+        immediate, coalesced flush, and shutdown flush."""
+        msg = raw_event.get("message") or {}
+        msg_type = msg.get("type", "")
+        source = raw_event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        user_id = source.get("userId", "") or chat_id
+
+        user_name = await self._resolve_sender_name(source, user_id)
+        chat_name = await self._resolve_chat_name(source, chat_id, chat_type)
+
+        # A coalesced image+caption must route as PHOTO (so vision fires), not
+        # as the TEXT type of whichever event happened to arrive last.
+        if media_types:
+            message_type = _LINE_MESSAGE_TYPES.get(media_types[0], MessageType.TEXT)
+        else:
+            message_type = _LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT)
+
         source_obj = self.build_source(
             chat_id=chat_id,
             chat_type=chat_type,
             user_id=user_id,
-            user_name=user_id,
-            chat_name=chat_id,
+            user_name=user_name,
+            chat_name=chat_name,
         )
 
         event_obj = MessageEvent(
             text=text,
-            message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
+            message_type=message_type,
             source=source_obj,
-            raw_message=event,
+            raw_message=raw_event,
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
         )
 
         await self.handle_message(event_obj)
+
+    # ------------------------------------------------------------------
+    # Sender / chat identity resolution
+    # ------------------------------------------------------------------
+
+    def _prune_name_cache(self) -> None:
+        """Drop expired identity entries opportunistically (mirrors the
+        _media_tokens eviction idiom — no background sweeper)."""
+        now = time.time()
+        for cache_key in list(self._name_cache.keys()):
+            if self._name_cache[cache_key][1] <= now:
+                self._name_cache.pop(cache_key, None)
+
+    async def _cached_lookup(self, cache_key: str, url: str, field_name: str) -> Optional[str]:
+        """Return ``field_name`` from ``url`` (via cache), or ``None`` on any
+        miss/error. Successful lookups are cached for the TTL; failures are
+        not cached, so a transient error retries on the next message."""
+        self._prune_name_cache()
+        cached = self._name_cache.get(cache_key)
+        if cached is not None and cached[1] > time.time():
+            return cached[0]
+        if not self._client:
+            return None
+        data = await self._client.get_json(url)
+        if not data:
+            return None
+        value = data.get(field_name)
+        if not value:
+            return None
+        self._name_cache[cache_key] = (value, time.time() + SENDER_NAME_CACHE_TTL_SECONDS)
+        return value
+
+    async def _resolve_sender_name(self, source: Dict[str, Any], user_id: str) -> str:
+        """Resolve a sender's LINE display name, fail-open to the raw id.
+
+        In group/room chats the raw ``U…`` id tells the agent nothing about
+        who is speaking. We resolve it via the member/profile API, cache the
+        result ~6h, and on any error fall back to the id so message handling
+        is never blocked.
+        """
+        if not self.sender_names or not user_id:
+            return user_id
+        src_type = (source or {}).get("type", "")
+        if src_type == "group":
+            group_id = source.get("groupId", "")
+            if not group_id:
+                return user_id
+            cache_key = f"member:group:{group_id}:{user_id}"
+            url = LINE_GROUP_MEMBER_URL_FMT.format(group_id=group_id, user_id=user_id)
+        elif src_type == "room":
+            room_id = source.get("roomId", "")
+            if not room_id:
+                return user_id
+            cache_key = f"member:room:{room_id}:{user_id}"
+            url = LINE_ROOM_MEMBER_URL_FMT.format(room_id=room_id, user_id=user_id)
+        else:
+            cache_key = f"profile:{user_id}"
+            url = LINE_PROFILE_URL_FMT.format(user_id=user_id)
+        try:
+            name = await self._cached_lookup(cache_key, url, "displayName")
+        except Exception as exc:  # defensive — resolution never blocks handling
+            logger.debug("LINE: sender-name resolution failed for %s: %s", user_id, exc)
+            return user_id
+        if name:
+            return name
+        logger.debug("LINE: no display name for %s; using raw id", user_id)
+        return user_id
+
+    async def _resolve_chat_name(
+        self, source: Dict[str, Any], chat_id: str, chat_type: str
+    ) -> str:
+        """Resolve a human chat title, fail-open to ``chat_id``.
+
+        Only group chats expose a summary endpoint (``groupName``); rooms are
+        anonymous and DMs have no group title, so those keep the id.
+        """
+        if not self.sender_names or chat_type != "group":
+            return chat_id
+        group_id = (source or {}).get("groupId", "") or chat_id
+        if not group_id:
+            return chat_id
+        cache_key = f"group_summary:{group_id}"
+        url = LINE_GROUP_SUMMARY_URL_FMT.format(group_id=group_id)
+        try:
+            name = await self._cached_lookup(cache_key, url, "groupName")
+        except Exception as exc:
+            logger.debug("LINE: chat-name resolution failed for %s: %s", group_id, exc)
+            return chat_id
+        return name or chat_id
 
     async def _handle_postback_event(self, event: Dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver cached payload."""
