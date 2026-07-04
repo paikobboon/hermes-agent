@@ -181,6 +181,23 @@ class TestDedup:
         d.is_duplicate("evt20")
         assert len(d._seen) <= 20  # bounded — exact cap depends on eviction policy
 
+    def test_dedup_persists_across_restarts(self, tmp_path):
+        persist = str(tmp_path / "line_dedup.json")
+        d1 = _MessageDeduplicator(persist_path=persist)
+        assert not d1.is_duplicate("evt-restart-1")
+        # A fresh instance (simulating a gateway restart) must recognize the id.
+        d2 = _MessageDeduplicator(persist_path=persist)
+        assert d2.is_duplicate("evt-restart-1")
+        # And still admit brand-new events.
+        assert not d2.is_duplicate("evt-restart-2")
+
+    def test_dedup_persist_path_unreadable_is_harmless(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        d = _MessageDeduplicator(persist_path=str(bad))
+        assert not d.is_duplicate("evt-x")
+        assert d.is_duplicate("evt-x")
+
 
 # ---------------------------------------------------------------------------
 # 5. RequestCache state machine

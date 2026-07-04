@@ -398,11 +398,36 @@ class RequestCache:
 # ---------------------------------------------------------------------------
 
 class _MessageDeduplicator:
-    """Bounded LRU of LINE webhook event IDs to ignore at-least-once retries."""
+    """Bounded LRU of LINE webhook event IDs to ignore at-least-once retries.
 
-    def __init__(self, max_size: int = 1000) -> None:
+    Optionally persists the seen-set to disk so redeliveries that straddle a
+    gateway restart (LINE webhook-redelivery is at-least-once) are still
+    recognized by the fresh process.
+    """
+
+    def __init__(self, max_size: int = 1000, persist_path: Optional[str] = None) -> None:
         self._seen: Dict[str, float] = {}
         self._max = max_size
+        self._persist_path = persist_path
+        if persist_path:
+            try:
+                with open(persist_path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    self._seen = {str(k): float(v) for k, v in loaded.items()}
+            except (FileNotFoundError, ValueError, OSError):
+                pass  # first run or unreadable state: start empty
+
+    def _persist(self) -> None:
+        if not self._persist_path:
+            return
+        try:
+            tmp = self._persist_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._seen, fh)
+            os.replace(tmp, self._persist_path)
+        except OSError:
+            pass  # persistence is best-effort; never break dispatch
 
     def is_duplicate(self, event_id: str) -> bool:
         if not event_id:
@@ -414,6 +439,7 @@ class _MessageDeduplicator:
             cutoff = sorted(self._seen.values())[len(self._seen) // 10 or 1]
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
         self._seen[event_id] = time.time()
+        self._persist()
         return False
 
 
@@ -1014,7 +1040,10 @@ class LineAdapter(BasePlatformAdapter):
         self._site = None  # aiohttp.web.TCPSite
         self._reply_tokens: Dict[str, Tuple[str, float]] = {}  # chat_id → (token, expiry)
         self._cache = RequestCache()
-        self._dedup = _MessageDeduplicator()
+        _dedup_state = os.path.join(os.path.expanduser("~/.hermes/profiles/lucky/state"), "line_dedup.json") if os.path.isdir(os.path.expanduser("~/.hermes/profiles/lucky")) else None
+        if _dedup_state:
+            os.makedirs(os.path.dirname(_dedup_state), exist_ok=True)
+        self._dedup = _MessageDeduplicator(persist_path=_dedup_state)
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
 
