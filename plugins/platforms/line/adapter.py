@@ -1973,6 +1973,8 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"image file not found: {image_path}")
         if path.stat().st_size > LINE_IMAGE_MAX_BYTES:
             return SendResult(success=False, error="image exceeds 10 MB LINE limit")
+        if not self._mark_media_egress_allowed(chat_id, str(path)):
+            return SendResult(success=True)
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not self.public_base_url and self.webhook_host == "0.0.0.0":

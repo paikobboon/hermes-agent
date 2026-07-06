@@ -34,6 +34,8 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+_MEDIA_EGRESS_GUARD_TTL_SECONDS = 90.0
+_MEDIA_EGRESS_GUARD_MAX_ENTRIES = 256
 
 
 def _platform_name(platform) -> str:
@@ -2206,6 +2208,10 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Per-adapter delivery boundary guard. Keyed by (chat_id, normalized
+        # media identity) so cross-lane or future send paths cannot emit the
+        # same image twice into one chat during a single turn-sized window.
+        self._media_egress_guard: dict[tuple[str, str], float] = {}
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -2978,6 +2984,8 @@ class BasePlatformAdapter(ABC):
         instead of plain-text URLs. Default falls back to sending the
         URL as a text message.
         """
+        if not self._mark_media_egress_allowed(chat_id, image_url):
+            return SendResult(success=True)
         # Fallback: send URL as text (subclasses override for native images)
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -3152,10 +3160,69 @@ class BasePlatformAdapter(ABC):
         Override in subclasses for native photo attachments.
         Default falls back to sending the file path as text.
         """
+        if not self._mark_media_egress_allowed(chat_id, image_path):
+            return SendResult(success=True)
         text = f"🖼️ Image: {image_path}"
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
+    @staticmethod
+    def media_egress_identity(media_reference: str) -> str:
+        """Return the duplicate-suppression identity for outbound media.
+
+        Local files use the same normalization as ``dedupe_delivery_paths``:
+        strip ``file://``, URL-decode, expand ``~``, then ``realpath``. HTTP(S)
+        URLs intentionally use the exact URL string because distinct signed URL
+        query strings can identify distinct resources. On macOS case-insensitive
+        volumes, ``realpath`` resolves symlinks but does not canonicalize path
+        spelling case, so differently-cased names for the same file may remain
+        distinct; this preserves the helper's existing realpath-based contract
+        and avoids collapsing genuinely different paths on case-sensitive
+        filesystems.
+        """
+        value = str(media_reference or "")
+        scheme = urlsplit(value).scheme.lower()
+        if scheme in {"http", "https"}:
+            return value
+        if value.lower().startswith("file://"):
+            value = value[7:]
+        return os.path.realpath(os.path.expanduser(unquote(value)))
+
+    def _mark_media_egress_allowed(self, chat_id: str, media_reference: str) -> bool:
+        """Return False when this chat recently saw the same media identity."""
+        guard = getattr(self, "_media_egress_guard", None)
+        if guard is None:
+            guard = {}
+            self._media_egress_guard = guard
+
+        now = time.monotonic()
+        expired = [
+            key for key, sent_at in guard.items()
+            if now - sent_at >= _MEDIA_EGRESS_GUARD_TTL_SECONDS
+        ]
+        for key in expired:
+            guard.pop(key, None)
+
+        identity = self.media_egress_identity(media_reference)
+        key = (str(chat_id), identity)
+        sent_at = guard.get(key)
+        if sent_at is not None:
+            age = now - sent_at
+            if age < _MEDIA_EGRESS_GUARD_TTL_SECONDS:
+                logger.warning(
+                    "media egress guard: suppressed duplicate %s to %s (sent %.1fs ago)",
+                    safe_url_for_log(identity),
+                    chat_id,
+                    age,
+                )
+                return False
+
+        guard[key] = now
+        while len(guard) > _MEDIA_EGRESS_GUARD_MAX_ENTRIES:
+            oldest_key = min(guard, key=guard.get)
+            guard.pop(oldest_key, None)
+        return True
 
     @staticmethod
     def validate_media_delivery_path(path: str) -> Optional[str]:
@@ -3218,13 +3285,20 @@ class BasePlatformAdapter(ABC):
         Identity:
             ``file://`` prefixes are stripped, the remaining path is URL-decoded,
             ``~`` is expanded, and ``os.path.realpath`` resolves the final key.
+            On macOS case-insensitive volumes, ``realpath`` does not normalize
+            spelling case; that nuance is intentional here so the helper stays
+            realpath-based rather than doing broader, platform-specific path
+            folding.
         """
         seen: set[str] = set()
         deduped_groups: list[list] = []
+        before_count = 0
+        after_count = 0
 
         for group in path_groups:
             deduped: list = []
             for item in group or []:
+                before_count += 1
                 raw_path = item[0] if isinstance(item, tuple) else item
                 path = str(raw_path)
                 if path.lower().startswith("file://"):
@@ -3234,7 +3308,11 @@ class BasePlatformAdapter(ABC):
                     continue
                 seen.add(identity)
                 deduped.append(item)
+                after_count += 1
             deduped_groups.append(deduped)
+
+        if after_count < before_count:
+            logger.info("cross-lane dedupe: %d -> %d", before_count, after_count)
 
         return tuple(deduped_groups)
 

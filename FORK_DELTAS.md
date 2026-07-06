@@ -18,6 +18,7 @@
 | `aadaff3d3` | Rotating copy (plural list keys, `random.choice` per send) + postback double-press dedupe (per-rid `DELIVERING` claim) | `pending_reply_texts` / `DELIVERING` in `plugins/platforms/line/adapter.py` | `test_line_plugin.py::` rotation + double-press cases |
 | `41b97b1f4` | Stale pending-button rid can no longer swallow sends: honor delivery result, tombstone payload, fall through to reply/push, WARN | `"pending-button delivery unavailable for rid"` in `plugins/platforms/line/adapter.py` `_send_messages` | covered via double-press/pending cases; live WARNING observed 2026-07-07 00:13 |
 | `7f6afaa84` | Cross-lane media dedupe — one file, one delivery. Shared `dedupe_delivery_paths(*groups)` (strip `file://`, URL-decode, expanduser, realpath; first-wins; shape-preserving) applied at base.py outbound assembly (×2), run.py queued path (×2), weixin.py direct send | `def dedupe_delivery_paths` in `gateway/platforms/base.py` | `tests/gateway/test_media_dedupe.py` (4 cases) |
+| `local` | Media egress guard — per-chat 90s TTL invariant closes duplicate image delivery at the outbound boundary; LINE local image sends share the guard before public URL registration; dedupe removals log `cross-lane dedupe: N -> M` | `media egress guard` in `gateway/platforms/base.py` | `tests/gateway/test_media_dedupe.py` incident A/B assembly replays + TTL boundary case |
 
 ## Pre-wave deltas (Pai-era, before 2026-07-06)
 
