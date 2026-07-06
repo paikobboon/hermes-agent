@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import base64
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -395,6 +396,85 @@ class TestSendRouting:
         # And the cache entry is unchanged (still PENDING for the eventual answer)
         assert adapter._cache.get(rid).state is State.PENDING
 
+    def test_pending_button_list_config_rotates_from_plural_keys(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "pending_reply_text": "singular text",
+            "pending_reply_texts": ["list text 1", "list text 2"],
+            "pending_button_label": "singular label",
+            "pending_button_labels": ["list label 1", "list label 2 that is too long"],
+        })
+        adapter = LineAdapter(cfg)
+        adapter.slow_response_threshold = 0.01
+        adapter._client = MagicMock()
+        adapter._client.reply = AsyncMock()
+        adapter._client.loading = AsyncMock()
+        adapter._reply_tokens["Uchat"] = ("reply-token", time.time() + 30)
+
+        choices = []
+
+        def fake_choice(options):
+            choices.append(tuple(options))
+            return options[-1]
+
+        monkeypatch.setattr(_line.random, "choice", fake_choice)
+
+        async def run_keep_typing_once():
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(
+                adapter._keep_typing("Uchat", interval=0.05, stop_event=stop_event)
+            )
+            await asyncio.sleep(0.04)
+            stop_event.set()
+            await task
+
+        asyncio.run(run_keep_typing_once())
+
+        adapter._client.reply.assert_called_once()
+        sent = adapter._client.reply.call_args.args[1][0]
+        assert sent["template"]["text"] == "list text 2"
+        assert sent["template"]["actions"][0]["label"] == (
+            "list label 2 that is too long"[:20]
+        )
+        assert ("list text 1", "list text 2") in choices
+        assert ("list label 1", "list label 2 that is too long") in choices
+
+    def test_double_pending_postback_press_delivers_once_on_completion(self, adapter):
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+
+        def event(reply_token):
+            return {
+                "type": "postback",
+                "replyToken": reply_token,
+                "source": {"type": "user", "userId": "Uchat"},
+                "postback": {
+                    "data": json.dumps({
+                        "action": "show_response",
+                        "request_id": rid,
+                    })
+                },
+            }
+
+        async def run_flow():
+            await adapter._handle_postback_event(event("tap-token-1"))
+            await adapter._handle_postback_event(event("tap-token-2"))
+            return await adapter.send("Uchat", "the answer")
+
+        result = asyncio.run(run_flow())
+
+        assert result.success
+        delivered_answer_calls = [
+            call for call in adapter._client.reply.call_args_list
+            if call.args[1][0].get("text") == "the answer"
+        ]
+        assert len(delivered_answer_calls) == 1
+        adapter._client.push.assert_not_called()
+        assert adapter._cache.get(rid).state is State.DELIVERED
+
     def test_send_caps_messages_per_call_at_five(self, adapter):
         # Build a payload that would naturally split into more than 5 LINE
         # bubbles; the chunker should cap at 5 + truncate.
@@ -649,6 +729,25 @@ class TestAdapterInit:
         ad = LineAdapter(PlatformConfig(enabled=True))
         assert ad.allowed_users == {"U1", "U2", "U3"}
         assert ad.allowed_groups == {"C1"}
+
+    def test_singular_slow_response_copy_keys_accept_lists(self, monkeypatch):
+        monkeypatch.delenv("LINE_PENDING_REPLY_TEXT", raising=False)
+        monkeypatch.delenv("LINE_PENDING_BUTTON_LABEL", raising=False)
+        monkeypatch.delenv("LINE_DELIVERED_TEXT", raising=False)
+        monkeypatch.delenv("LINE_INTERRUPTED_TEXT", raising=False)
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "t",
+            "channel_secret": "s",
+            "pending_reply_text": ["wait 1", "wait 2"],
+            "pending_button_label": ["get 1", "get 2"],
+            "delivered_text": ["done 1", "done 2"],
+            "interrupted_text": ["stop 1", "stop 2"],
+        }))
+        assert ad.pending_reply_texts == ["wait 1", "wait 2"]
+        assert ad.pending_button_labels == ["get 1", "get 2"]
+        assert ad.delivered_texts == ["done 1", "done 2"]
+        assert ad.interrupted_texts == ["stop 1", "stop 2"]
 
     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")

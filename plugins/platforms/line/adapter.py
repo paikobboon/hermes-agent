@@ -69,6 +69,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import tempfile
@@ -310,6 +311,7 @@ def verify_line_signature(body: bytes, signature: str, channel_secret: str) -> b
 class State(enum.Enum):
     PENDING = "pending"  # button sent, LLM still running
     READY = "ready"      # LLM done, response cached, waiting for postback tap
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
     ERROR = "error"      # LLM raised / interrupted; cached error text waiting
 
@@ -366,9 +368,26 @@ class RequestCache:
 
     def mark_delivered(self, request_id: str) -> None:
         entry = self._entries.get(request_id)
-        if entry is None or entry.state not in {State.READY, State.ERROR}:
+        if entry is None or entry.state not in {State.READY, State.ERROR, State.DELIVERING}:
             return
         entry.state = State.DELIVERED
+        entry.updated_at = time.time()
+
+    def claim_delivery(self, request_id: str) -> Optional[Tuple[State, Any]]:
+        entry = self._entries.get(request_id)
+        if entry is None or entry.state not in {State.READY, State.ERROR}:
+            return None
+        previous_state = entry.state
+        payload = entry.payload
+        entry.state = State.DELIVERING
+        entry.updated_at = time.time()
+        return previous_state, payload
+
+    def release_delivery_claim(self, request_id: str, previous_state: State) -> None:
+        entry = self._entries.get(request_id)
+        if entry is None or entry.state is not State.DELIVERING:
+            return
+        entry.state = previous_state
         entry.updated_at = time.time()
 
     def find_pending_for_chat(self, chat_id: str) -> Optional[str]:
@@ -933,6 +952,41 @@ def _text_setting(env_name: str, extra_value: Any, default: str) -> str:
     return value or default
 
 
+def _text_choices(
+    env_name: str,
+    plural_value: Any,
+    singular_value: Any,
+    default: str,
+) -> List[str]:
+    raw = os.getenv(env_name)
+    if raw is not None:
+        value = str(raw).strip()
+        return [value or default]
+
+    for candidate in (plural_value, singular_value):
+        choices = _coerce_text_choices(candidate)
+        if choices:
+            return choices
+    return [default]
+
+
+def _coerce_text_choices(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    value = str(raw).strip()
+    return [value] if value else []
+
+
+def _choose_text(choices: List[str], default: str) -> str:
+    if not choices:
+        return default
+    if len(choices) == 1:
+        return choices[0]
+    return random.choice(choices)
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -1000,27 +1054,36 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.slow_response_threshold = DEFAULT_SLOW_RESPONSE_THRESHOLD
 
-        # Per-profile slow-response copy; LINE button labels hard-cap at 20 chars.
-        self.pending_reply_text = _text_setting(
+        # Per-profile slow-response copy; plural YAML list keys take precedence.
+        # LINE button labels hard-cap at 20 chars when each chosen label is sent.
+        self.pending_reply_texts = _text_choices(
             "LINE_PENDING_REPLY_TEXT",
+            extra.get("pending_reply_texts"),
             extra.get("pending_reply_text"),
             DEFAULT_PENDING_REPLY_TEXT,
         )
-        self.pending_button_label = _text_setting(
+        self.pending_reply_text = self.pending_reply_texts[0]
+        self.pending_button_labels = _text_choices(
             "LINE_PENDING_BUTTON_LABEL",
+            extra.get("pending_button_labels"),
             extra.get("pending_button_label"),
             DEFAULT_BUTTON_LABEL,
         )
-        self.delivered_text = _text_setting(
+        self.pending_button_label = self.pending_button_labels[0]
+        self.delivered_texts = _text_choices(
             "LINE_DELIVERED_TEXT",
+            extra.get("delivered_texts"),
             extra.get("delivered_text"),
             DEFAULT_DELIVERED_TEXT,
         )
-        self.interrupted_text = _text_setting(
+        self.delivered_text = self.delivered_texts[0]
+        self.interrupted_texts = _text_choices(
             "LINE_INTERRUPTED_TEXT",
+            extra.get("interrupted_texts"),
             extra.get("interrupted_text"),
             DEFAULT_INTERRUPTED_TEXT,
         )
+        self.interrupted_text = self.interrupted_texts[0]
 
         # Sender/chat identity resolution (group chats need "who is speaking").
         self.sender_names = _truthy_env(
@@ -1069,6 +1132,7 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+        self._pending_delivery_tokens: Dict[str, Tuple[str, str, float]] = {}
 
         # Identity-resolution cache: key → (resolved_name, expiry). Keys are
         # namespaced by lookup kind (member/profile/group summary).
@@ -1511,43 +1575,110 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client or not reply_token or not entry:
             return
 
-        if entry.state is State.READY:
-            payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
-            try:
-                await self._client.reply(reply_token, messages)
-                self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
-            except Exception as exc:
-                logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
-                try:
-                    await self._client.push(chat_id, messages)
-                    self._cache.mark_delivered(request_id)
-                    self._pending_buttons.pop(chat_id, None)
-                except Exception as exc2:
-                    logger.error("LINE: postback push fallback failed: %s", exc2)
-        elif entry.state is State.ERROR:
-            text = str(entry.payload or self.interrupted_text)
-            try:
-                await self._client.reply(reply_token, [_text_message(text)])
-                self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
-            except Exception as exc:
-                logger.warning("LINE: postback ERROR reply failed: %s", exc)
+        if entry.state in {State.READY, State.ERROR}:
+            await self._deliver_cached_response(request_id, chat_id, reply_token)
         elif entry.state is State.DELIVERED:
             try:
-                await self._client.reply(reply_token, [_text_message(self.delivered_text)])
-            except Exception:
-                pass
-        elif entry.state is State.PENDING:
-            # Still working — re-issue the wait notice.
-            try:
                 await self._client.reply(
-                    reply_token, [_text_message(self.pending_reply_text)]
+                    reply_token, [_text_message(self._select_delivered_text())]
                 )
             except Exception:
                 pass
+        elif entry.state is State.DELIVERING:
+            return
+        elif entry.state is State.PENDING:
+            if self._register_pending_delivery_token(request_id, chat_id, reply_token):
+                return
+            # Another tap already owns eventual delivery; keep this tap cheap.
+            try:
+                await self._client.reply(
+                    reply_token, [_text_message(self._select_pending_reply_text())]
+                )
+            except Exception:
+                pass
+
+    def _register_pending_delivery_token(
+        self,
+        request_id: str,
+        chat_id: str,
+        reply_token: str,
+    ) -> bool:
+        if request_id in self._pending_delivery_tokens:
+            return False
+        self._pending_delivery_tokens[request_id] = (
+            chat_id,
+            reply_token,
+            time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
+        )
+        return True
+
+    async def _deliver_registered_pending_response(self, request_id: str) -> bool:
+        delivery = self._pending_delivery_tokens.get(request_id)
+        if not delivery:
+            return False
+        chat_id, reply_token, expires_at = delivery
+        usable_reply_token = reply_token if time.time() < expires_at else ""
+        return await self._deliver_cached_response(
+            request_id, chat_id, usable_reply_token
+        )
+
+    async def _deliver_cached_response(
+        self,
+        request_id: str,
+        chat_id: str,
+        reply_token: str,
+    ) -> bool:
+        claim = self._cache.claim_delivery(request_id)
+        if claim is None:
+            return False
+        previous_state, payload = claim
+        messages = self._messages_for_cached_payload(payload, previous_state)
+        if not messages:
+            messages = [_text_message("")]
+
+        try:
+            if reply_token:
+                await self._client.reply(reply_token, messages)
+            else:
+                await self._client.push(chat_id, messages)
+            self._cache.mark_delivered(request_id)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(request_id, None)
+            return True
+        except Exception as exc:
+            logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
+            if not reply_token:
+                self._cache.release_delivery_claim(request_id, previous_state)
+                return False
+
+        try:
+            await self._client.push(chat_id, messages)
+            self._cache.mark_delivered(request_id)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(request_id, None)
+            return True
+        except Exception as exc2:
+            logger.error("LINE: postback push fallback failed: %s", exc2)
+            self._cache.release_delivery_claim(request_id, previous_state)
+            return False
+
+    def _messages_for_cached_payload(
+        self,
+        payload: Any,
+        state: State,
+    ) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return [
+                message for message in payload[:LINE_MAX_MESSAGES_PER_CALL]
+                if isinstance(message, dict)
+            ]
+        text = (
+            str(payload or self._select_interrupted_text())
+            if state is State.ERROR
+            else str(payload or "")
+        )
+        chunks = split_for_line(strip_markdown_preserving_urls(text))
+        return [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
     async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
         if not self._client or not message_id:
@@ -1594,6 +1725,7 @@ class LineAdapter(BasePlatformAdapter):
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
+            await self._deliver_registered_pending_response(pending_rid)
             return SendResult(success=True, message_id=pending_rid)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
@@ -1663,6 +1795,18 @@ class LineAdapter(BasePlatformAdapter):
         """Strip Markdown that LINE can't render. URLs are preserved."""
         return strip_markdown_preserving_urls(content)
 
+    def _select_pending_reply_text(self) -> str:
+        return _choose_text(self.pending_reply_texts, DEFAULT_PENDING_REPLY_TEXT)
+
+    def _select_pending_button_label(self) -> str:
+        return _choose_text(self.pending_button_labels, DEFAULT_BUTTON_LABEL)
+
+    def _select_delivered_text(self) -> str:
+        return _choose_text(self.delivered_texts, DEFAULT_DELIVERED_TEXT)
+
+    def _select_interrupted_text(self) -> str:
+        return _choose_text(self.interrupted_texts, DEFAULT_INTERRUPTED_TEXT)
+
     # ------------------------------------------------------------------
     # Slow-LLM postback button — driven by _keep_typing
     # ------------------------------------------------------------------
@@ -1700,7 +1844,9 @@ class LineAdapter(BasePlatformAdapter):
                 self._pending_buttons.pop(chat_id, None)
                 return
             msg = build_postback_button_message(
-                self.pending_reply_text, self.pending_button_label, rid
+                self._select_pending_reply_text(),
+                self._select_pending_button_label(),
+                rid,
             )
             try:
                 await self._client.reply(token, [msg])
@@ -1725,7 +1871,8 @@ class LineAdapter(BasePlatformAdapter):
         await super().interrupt_session_activity(session_key, chat_id)
         rid = self._pending_buttons.pop(chat_id, None)
         if rid:
-            self._cache.set_error(rid, self.interrupted_text)
+            self._cache.set_error(rid, self._select_interrupted_text())
+            await self._deliver_registered_pending_response(rid)
 
     # ------------------------------------------------------------------
     # Outbound media (image / voice / video)
@@ -1923,6 +2070,15 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="LINE adapter not connected")
         if not messages:
             return SendResult(success=True, message_id=None)
+
+        pending_rid = self._pending_buttons.get(chat_id)
+        if pending_rid:
+            self._cache.set_ready(
+                pending_rid,
+                messages[:LINE_MAX_MESSAGES_PER_CALL],
+            )
+            await self._deliver_registered_pending_response(pending_rid)
+            return SendResult(success=True, message_id=pending_rid)
 
         first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
         rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
