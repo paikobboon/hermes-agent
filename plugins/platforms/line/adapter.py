@@ -2077,8 +2077,23 @@ class LineAdapter(BasePlatformAdapter):
                 pending_rid,
                 messages[:LINE_MAX_MESSAGES_PER_CALL],
             )
-            await self._deliver_registered_pending_response(pending_rid)
-            return SendResult(success=True, message_id=pending_rid)
+            if await self._deliver_registered_pending_response(pending_rid):
+                return SendResult(success=True, message_id=pending_rid)
+            # Stale button rid (no registered press, tokens expired, or the
+            # payload claim was already spent): do NOT swallow the send.
+            # Tombstone the cached payload so a very late press of the old
+            # button can't replay it, clear the stale entry, and fall through
+            # to the normal reply/push path. (2026-07-06: a leftover rid
+            # silently ate two real replies — "sent" was logged, nothing
+            # reached the chat.)
+            logger.warning(
+                "LINE: pending-button delivery unavailable for rid=%s; "
+                "clearing stale entry and sending via reply/push",
+                pending_rid,
+            )
+            self._cache.mark_delivered(pending_rid)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(pending_rid, None)
 
         first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
         rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
