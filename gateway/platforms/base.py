@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -3188,6 +3188,56 @@ class BasePlatformAdapter(ABC):
                 logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
         return safe_paths
 
+    @staticmethod
+    def dedupe_delivery_paths(*path_groups):
+        """
+        Remove duplicate attachment paths across extractor lanes.
+
+        Hermes' outbound assembly gathers deliverables from multiple extractors:
+        explicit ``MEDIA:`` tags, image/link extraction, and bare local path
+        detection. Each extractor dedupes only within its own result set, so the
+        same file can otherwise be delivered twice when it appears in two forms
+        such as ``MEDIA:/tmp/a.png`` plus ``/tmp/a.png``, or
+        ``file:///tmp/a.png`` plus the absolute path.
+
+        This fork-maintained helper (2026-07-07) is intentionally additive and
+        dependency-free so downstream fork delivery paths can share one stable
+        cross-lane identity rule without changing extractor behavior.
+
+        Args:
+            *path_groups: Any number of iterables. Items may be bare path strings
+                or tuple-shaped media entries whose first element is the path
+                and remaining values are preserved (for example ``(path,
+                is_voice)``).
+
+        Returns:
+            A tuple containing one list per input group. Item shapes and original
+            item values are preserved, first occurrence wins in argument order,
+            and order is preserved within each group.
+
+        Identity:
+            ``file://`` prefixes are stripped, the remaining path is URL-decoded,
+            ``~`` is expanded, and ``os.path.realpath`` resolves the final key.
+        """
+        seen: set[str] = set()
+        deduped_groups: list[list] = []
+
+        for group in path_groups:
+            deduped: list = []
+            for item in group or []:
+                raw_path = item[0] if isinstance(item, tuple) else item
+                path = str(raw_path)
+                if path.lower().startswith("file://"):
+                    path = path[7:]
+                identity = os.path.realpath(os.path.expanduser(unquote(path)))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                deduped.append(item)
+            deduped_groups.append(deduped)
+
+        return tuple(deduped_groups)
+
 
     @staticmethod
     def _mask_protected_spans(content: str) -> str:
@@ -4560,6 +4610,8 @@ class BasePlatformAdapter(ABC):
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
+                media_files, local_files = self.dedupe_delivery_paths(media_files, local_files)
+
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
                 # below then drops it silently. Recover on every platform (#33842
@@ -4706,6 +4758,8 @@ class BasePlatformAdapter(ABC):
                         _image_paths.append(file_path)
                     else:
                         _non_image_local.append(file_path)
+
+                (_image_paths,) = self.dedupe_delivery_paths(_image_paths)
 
                 if _image_paths:
                     try:

@@ -11143,6 +11143,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            media_files, local_files = BasePlatformAdapter.dedupe_delivery_paths(media_files, local_files)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -11171,6 +11172,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     image_paths.append(file_path)
                 else:
                     non_image_local.append(file_path)
+
+            (image_paths,) = BasePlatformAdapter.dedupe_delivery_paths(image_paths)
 
             if image_paths:
                 try:
