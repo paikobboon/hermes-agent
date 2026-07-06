@@ -179,7 +179,7 @@ async def test_media_egress_guard_suppresses_duplicate_within_ttl_and_allows_aft
     assert _sent_image_paths(adapter) == [str(artifact)]
     assert "media egress guard: suppressed duplicate" in caplog.text
 
-    now += 91.0
+    now += 9.0
     third = await adapter.send_image_file("chat-guard", str(artifact))
 
     assert third.success is True

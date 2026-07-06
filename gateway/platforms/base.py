@@ -34,7 +34,11 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
-_MEDIA_EGRESS_GUARD_TTL_SECONDS = 90.0
+# 8s: sub-turn window only. The duplicate-delivery class is same-turn multi-lane
+# emission; a cross-turn window risks silently suppressing a legitimate resend
+# (Cato audit W1, 2026-07-07 — in a health context a silent drop of an updated
+# image is worse than a duplicate).
+_MEDIA_EGRESS_GUARD_TTL_SECONDS = 8.0
 _MEDIA_EGRESS_GUARD_MAX_ENTRIES = 256
 
 
@@ -3187,7 +3191,15 @@ class BasePlatformAdapter(ABC):
             return value
         if value.lower().startswith("file://"):
             value = value[7:]
-        return os.path.realpath(os.path.expanduser(unquote(value)))
+        resolved = os.path.realpath(os.path.expanduser(unquote(value)))
+        # Content-aware: a regenerated file at the same path (new mtime/size)
+        # is a NEW identity — the guard must never suppress updated content
+        # (Cato audit W1, 2026-07-07).
+        try:
+            st = os.stat(resolved)
+            return f"{resolved}|{st.st_mtime_ns}|{st.st_size}"
+        except OSError:
+            return resolved
 
     def _mark_media_egress_allowed(self, chat_id: str, media_reference: str) -> bool:
         """Return False when this chat recently saw the same media identity."""
