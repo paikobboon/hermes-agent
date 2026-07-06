@@ -860,11 +860,11 @@ def build_postback_button_message(
             "actions": [
                 {
                     "type": "postback",
-                    "label": button_label[:20] or "Get answer",
+                    "label": button_label[:20] or DEFAULT_BUTTON_LABEL,
                     "data": json.dumps(
                         {"action": "show_response", "request_id": request_id}
                     ),
-                    "displayText": button_label[:300] or "Get answer",
+                    "displayText": button_label[:300] or DEFAULT_BUTTON_LABEL,
                 }
             ],
         },
@@ -921,6 +921,16 @@ def _float_setting(env_name: str, extra_value: Any, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _text_setting(env_name: str, extra_value: Any, default: str) -> str:
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = extra_value
+    if raw is None:
+        return default
+    value = str(raw).strip()
+    return value or default
 
 
 # ---------------------------------------------------------------------------
@@ -990,22 +1000,26 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.slow_response_threshold = DEFAULT_SLOW_RESPONSE_THRESHOLD
 
-        # User-overridable copy
-        self.pending_text = (
-            os.getenv("LINE_PENDING_TEXT")
-            or extra.get("pending_text", DEFAULT_PENDING_REPLY_TEXT)
+        # Per-profile slow-response copy; LINE button labels hard-cap at 20 chars.
+        self.pending_reply_text = _text_setting(
+            "LINE_PENDING_REPLY_TEXT",
+            extra.get("pending_reply_text"),
+            DEFAULT_PENDING_REPLY_TEXT,
         )
-        self.button_label = (
-            os.getenv("LINE_BUTTON_LABEL")
-            or extra.get("button_label", DEFAULT_BUTTON_LABEL)
+        self.pending_button_label = _text_setting(
+            "LINE_PENDING_BUTTON_LABEL",
+            extra.get("pending_button_label"),
+            DEFAULT_BUTTON_LABEL,
         )
-        self.delivered_text = (
-            os.getenv("LINE_DELIVERED_TEXT")
-            or extra.get("delivered_text", DEFAULT_DELIVERED_TEXT)
+        self.delivered_text = _text_setting(
+            "LINE_DELIVERED_TEXT",
+            extra.get("delivered_text"),
+            DEFAULT_DELIVERED_TEXT,
         )
-        self.interrupted_text = (
-            os.getenv("LINE_INTERRUPTED_TEXT")
-            or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
+        self.interrupted_text = _text_setting(
+            "LINE_INTERRUPTED_TEXT",
+            extra.get("interrupted_text"),
+            DEFAULT_INTERRUPTED_TEXT,
         )
 
         # Sender/chat identity resolution (group chats need "who is speaking").
@@ -1529,7 +1543,9 @@ class LineAdapter(BasePlatformAdapter):
         elif entry.state is State.PENDING:
             # Still working — re-issue the wait notice.
             try:
-                await self._client.reply(reply_token, [_text_message(self.pending_text)])
+                await self._client.reply(
+                    reply_token, [_text_message(self.pending_reply_text)]
+                )
             except Exception:
                 pass
 
@@ -1684,7 +1700,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._pending_buttons.pop(chat_id, None)
                 return
             msg = build_postback_button_message(
-                self.pending_text, self.button_label, rid
+                self.pending_reply_text, self.pending_button_label, rid
             )
             try:
                 await self._client.reply(token, [msg])
@@ -2127,7 +2143,7 @@ def register(ctx) -> None:
             "is capped at 5000 characters and at most 5 bubbles are sent per "
             "reply, so keep responses concise. Image/audio/video sending "
             "requires LINE_PUBLIC_URL configured to a publicly reachable HTTPS "
-            "host. Slow responses surface a 'Get answer' button the user taps "
+            "host. Slow responses surface a postback button the user taps "
             "to fetch the reply via a fresh free token."
         ),
     )
