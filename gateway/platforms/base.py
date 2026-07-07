@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -3171,6 +3171,117 @@ class BasePlatformAdapter(ABC):
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
+    async def assemble_and_send_media(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> str:
+        """Deliver native media attachments from ``content`` and return cleaned text.
+
+        This is the shared outbound assembly used by both interactive gateway
+        replies and cron/scheduled delivery: explicit ``MEDIA:`` tags are
+        extracted first, markdown/HTML image tags second, and bare local paths
+        last so each extractor sees the previous extractor's cleaned text.
+        """
+        force_document_attachments = "[[as_document]]" in content
+
+        media_files, cleaned = self.extract_media(content)
+        media_files = self.filter_media_delivery_paths(media_files)
+
+        images, cleaned = self.extract_images(cleaned)
+        cleaned = _strip_media_directives(cleaned).strip()
+
+        local_files, cleaned = self.extract_local_files(cleaned)
+        local_files = self.filter_local_delivery_paths(local_files)
+
+        media_files, local_files = self.dedupe_delivery_paths(media_files, local_files)
+
+        _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+        _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+        image_paths: list[str] = []
+        non_image_media: list[tuple[str, bool]] = []
+        for media_path, is_voice in media_files:
+            ext = Path(media_path).suffix.lower()
+            if ext in _IMAGE_EXTS and not is_voice and not force_document_attachments:
+                image_paths.append(media_path)
+            else:
+                non_image_media.append((media_path, is_voice))
+
+        non_image_local: list[str] = []
+        for file_path in local_files:
+            if Path(file_path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments:
+                image_paths.append(file_path)
+            else:
+                non_image_local.append(file_path)
+
+        (image_paths,) = self.dedupe_delivery_paths(image_paths)
+
+        if images or image_paths:
+            batch = list(images)
+            batch.extend((f"file://{quote(path)}", "") for path in image_paths)
+            try:
+                await self.send_multiple_images(
+                    chat_id=chat_id,
+                    images=batch,
+                    metadata=metadata,
+                    human_delay=human_delay,
+                )
+            except Exception as batch_err:
+                logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+
+        for media_path, is_voice in non_image_media:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                ext = Path(media_path).suffix.lower()
+                if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                    result = await self.send_voice(
+                        chat_id=chat_id,
+                        audio_path=media_path,
+                        metadata=metadata,
+                    )
+                elif ext in _VIDEO_EXTS:
+                    result = await self.send_video(
+                        chat_id=chat_id,
+                        video_path=media_path,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await self.send_document(
+                        chat_id=chat_id,
+                        file_path=media_path,
+                        metadata=metadata,
+                    )
+                if not getattr(result, "success", True):
+                    logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, getattr(result, "error", None))
+            except Exception as media_err:
+                logger.warning("[%s] Error sending media: %s", self.name, media_err)
+
+        for file_path in non_image_local:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                ext = Path(file_path).suffix.lower()
+                if ext in _VIDEO_EXTS:
+                    await self.send_video(
+                        chat_id=chat_id,
+                        video_path=file_path,
+                        metadata=metadata,
+                    )
+                else:
+                    await self.send_document(
+                        chat_id=chat_id,
+                        file_path=file_path,
+                        metadata=metadata,
+                    )
+            except Exception as file_err:
+                logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+        return cleaned
+
     @staticmethod
     def media_egress_identity(media_reference: str) -> str:
         """Return the duplicate-suppression identity for outbound media.
@@ -3574,7 +3685,20 @@ class BasePlatformAdapter(ABC):
         cleaned = content
         if unique:
             for raw, _exp in unique:
+                cleaned = re.sub(
+                    r'^[^\S\n]*' + re.escape(raw) + r'[^\S\n]*(?:\n|$)',
+                    '',
+                    cleaned,
+                    flags=re.MULTILINE,
+                )
                 cleaned = cleaned.replace(raw, '')
+            cleaned = re.sub(
+                r'^[^\S\n]*!\[[^\]]*\]\(\s*\)[^\S\n]*(?:\n|$)',
+                '',
+                cleaned,
+                flags=re.MULTILINE,
+            )
+            cleaned = re.sub(r'!\[[^\]]*\]\(\s*\)', '', cleaned)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         return paths, cleaned
