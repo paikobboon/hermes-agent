@@ -2418,9 +2418,9 @@ async def _standalone_send(
     if not token or not chat_id:
         return {"error": "LINE standalone send: missing token or chat_id"}
 
-    plain = strip_markdown_preserving_urls(message or "")
-    chunks = split_for_line(plain) or [""]
-    messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+    messages = _messages_from_text_payload(message or "")
+    if not messages:
+        return {"success": True, "message_id": None}
     if media_files:
         # Tack on a hint so the recipient knows media was generated but not delivered.
         messages.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))

@@ -756,6 +756,41 @@ class TestStandaloneSend:
         # Message wraps as text bubble
         assert push_calls[0][1][0]["type"] == "text"
 
+    def test_standalone_send_parses_sticker_markers(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        push_calls = []
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def push(self, chat_id, messages):
+                push_calls.append((chat_id, messages))
+
+        monkeypatch.setattr(_line, "_LineClient", _FakeClient)
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"channel_access_token": "tok"},
+        )
+        result = asyncio.run(
+            _standalone_send(cfg, "Uchat", "ขอบคุณค่ะ 💙\nSTICKER:789:10863")
+        )
+
+        assert result.get("success") is True
+        assert len(push_calls) == 1
+        messages = push_calls[0][1]
+        sticker_messages = [
+            message for message in messages if message.get("type") == "sticker"
+        ]
+        assert sticker_messages == [
+            {"type": "sticker", "packageId": "789", "stickerId": "10863"},
+        ]
+        text_messages = [message for message in messages if message.get("type") == "text"]
+        assert len(text_messages) == 1
+        assert any("ขอบคุณค่ะ" in message.get("text", "") for message in text_messages)
+        assert not any("STICKER:" in message.get("text", "") for message in text_messages)
+
 
 class TestPostbackButtonShape:
 
