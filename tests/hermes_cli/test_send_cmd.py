@@ -136,6 +136,54 @@ def test_quiet_suppresses_stdout(fake_tool, capsys):
     assert out.out == ""
 
 
+def test_successful_explicit_send_fallback_mirrors_target_session(fake_tool, monkeypatch):
+    mirror_calls = []
+
+    def fake_mirror(platform, chat_id, text, **kwargs):
+        mirror_calls.append((platform, chat_id, text, kwargs))
+        return True
+
+    monkeypatch.setattr("gateway.mirror.mirror_to_session", fake_mirror)
+
+    args = _parse(["--to", "line:U12345", "hello Pai"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert mirror_calls == [
+        (
+            "line",
+            "U12345",
+            "hello Pai",
+            {"source_label": "cli-send", "thread_id": None},
+        )
+    ]
+
+
+def test_successful_send_does_not_double_mirror_when_tool_already_did_it(monkeypatch):
+    import sys as _sys
+    import types as _types
+
+    fake_mod = _types.ModuleType("tools.send_message_tool")
+    fake_mod.send_message_tool = lambda args, **_kw: json.dumps(
+        {"success": True, "message_id": "m123", "mirrored": True}
+    )
+    monkeypatch.setitem(_sys.modules, "tools.send_message_tool", fake_mod)
+
+    mirror_calls = []
+    monkeypatch.setattr(
+        "gateway.mirror.mirror_to_session",
+        lambda *args, **kwargs: mirror_calls.append((args, kwargs)) or True,
+    )
+
+    args = _parse(["--to", "line:U12345", "hello Pai"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert mirror_calls == []
+
+
 # ---------------------------------------------------------------------------
 # Error paths
 # ---------------------------------------------------------------------------

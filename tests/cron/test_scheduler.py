@@ -552,7 +552,7 @@ class TestRoutingIntents:
 
 
 class TestDeliverResultWrapping:
-    """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
+    """Verify that cron deliveries are wrapped, cleaned, delivered, and mirrored."""
 
     def _safe_media_path(self, tmp_path, monkeypatch, name, data=b"media"):
         root = tmp_path / "media-cache"
@@ -676,6 +676,9 @@ class TestDeliverResultWrapping:
         media_path = self._safe_media_path(tmp_path, monkeypatch, "cron-voice.mp3")
 
         adapter = AsyncMock()
+        adapter.assemble_and_send_media.side_effect = (
+            lambda *, chat_id, content, metadata=None: content
+        )
         adapter.send.return_value = MagicMock(success=True)
         adapter.send_voice.return_value = MagicMock(success=True)
 
@@ -708,7 +711,8 @@ class TestDeliverResultWrapping:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.mirror.mirror_to_session") as mirror_mock:
             _deliver_result(
                 job,
                 f"Here is TTS\nMEDIA:{media_path}",
@@ -726,6 +730,13 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+        mirror_mock.assert_called_once_with(
+            "discord",
+            "9876",
+            "Here is TTS",
+            source_label="cron",
+            thread_id=None,
+        )
 
     def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
         """Image MEDIA files should be routed to send_image_file, not send_voice."""
@@ -734,6 +745,9 @@ class TestDeliverResultWrapping:
         media_path = self._safe_media_path(tmp_path, monkeypatch, "chart.png")
 
         adapter = AsyncMock()
+        adapter.assemble_and_send_media.side_effect = (
+            lambda *, chat_id, content, metadata=None: content
+        )
         adapter.send.return_value = MagicMock(success=True)
         adapter.send_image_file.return_value = MagicMock(success=True)
 
@@ -834,6 +848,9 @@ class TestDeliverResultWrapping:
         from concurrent.futures import Future
 
         adapter = AsyncMock()
+        adapter.assemble_and_send_media.side_effect = (
+            lambda *, chat_id, content, metadata=None: content
+        )
         adapter.send.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
@@ -876,8 +893,8 @@ class TestDeliverResultWrapping:
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
 
-    def test_no_mirror_to_session_call(self):
-        """Cron deliveries should NOT mirror into the gateway session."""
+    def test_successful_delivery_mirrors_to_target_session(self):
+        """Cron deliveries should mirror successful sends into the target session."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -895,6 +912,38 @@ class TestDeliverResultWrapping:
             }
             _deliver_result(job, "Hello!")
 
+        mirror_mock.assert_called_once_with(
+            "telegram",
+            "123",
+            "Cronjob Response: test-job\n"
+            "(job_id: test-job)\n"
+            "-------------\n\n"
+            "Hello!\n\n"
+            'To stop or manage this job, send me a new message (e.g. "stop reminder test-job").',
+            source_label="cron",
+            thread_id=None,
+        )
+
+    def test_failed_delivery_does_not_mirror_to_target_session(self):
+        """Cron delivery failures should not create assistant history."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"error": "timed out"})), \
+             patch("gateway.mirror.mirror_to_session") as mirror_mock:
+            job = {
+                "id": "test-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            result = _deliver_result(job, "Hello!")
+
+        assert "timed out" in result
         mirror_mock.assert_not_called()
 
     def test_origin_delivery_preserves_thread_id(self):
@@ -3037,6 +3086,9 @@ class TestDeliverResultTimeoutCancelsFuture:
 
         send_result = SendResult(success=True, message_id="42")
         adapter = MagicMock()
+        adapter.assemble_and_send_media = AsyncMock(
+            side_effect=lambda *, chat_id, content, metadata=None: content
+        )
         adapter.send = AsyncMock(return_value=send_result)
 
         pconfig = MagicMock()
@@ -3104,6 +3156,9 @@ class TestDeliverResultTimeoutCancelsFuture:
         media_path = media_file.resolve()
 
         adapter = AsyncMock()
+        adapter.assemble_and_send_media.side_effect = (
+            lambda *, chat_id, content, metadata=None: content
+        )
         adapter.send.return_value = SendResult(success=True, message_id="1")
         adapter.send_image_file.return_value = SendResult(success=True, message_id="2")
 
@@ -3166,6 +3221,9 @@ class TestDeliverResultTimeoutCancelsFuture:
             },
         )
         adapter = MagicMock()
+        adapter.assemble_and_send_media = AsyncMock(
+            side_effect=lambda *, chat_id, content, metadata=None: content
+        )
         adapter.send = AsyncMock(return_value=send_result)
 
         pconfig = MagicMock()

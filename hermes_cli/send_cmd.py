@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -36,6 +38,8 @@ from typing import Optional
 _USAGE_EXIT = 2
 _FAILURE_EXIT = 1
 _SUCCESS_EXIT = 0
+_MEDIA_TAG_RE = re.compile(r"MEDIA:([^\s]+)")
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic"}
 
 
 def _read_message_body(
@@ -137,6 +141,75 @@ def _emit_result(
         return _SUCCESS_EXIT
     # Unknown / unexpected — treat as failure so scripts notice.
     return _FAILURE_EXIT
+
+
+def _parse_result_payload(result_json: str) -> dict:
+    try:
+        payload = json.loads(result_json) if result_json else {}
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _explicit_mirror_target(target: str) -> tuple[str, str, Optional[str]] | None:
+    parts = target.split(":", 2)
+    if len(parts) < 2:
+        return None
+    platform_name = parts[0].strip().lower()
+    chat_id = parts[1].strip()
+    thread_id = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+    if not platform_name or not chat_id:
+        return None
+    return platform_name, chat_id, thread_id
+
+
+def _mirror_text_for_message(message: str) -> str:
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+        from tools.send_message_tool import _describe_media_for_mirror
+
+        media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        return cleaned_message.strip() or _describe_media_for_mirror(media_files)
+    except Exception:
+        cleaned = _MEDIA_TAG_RE.sub("", message).strip()
+        if cleaned:
+            return cleaned
+        media_paths = _MEDIA_TAG_RE.findall(message)
+        if not media_paths:
+            return ""
+        if len(media_paths) == 1:
+            ext = os.path.splitext(media_paths[0])[1].lower()
+            return "[sent an image]" if ext in _IMAGE_EXTS else "[sent a file]"
+        return f"[sent {len(media_paths)} files]"
+
+
+def _mirror_successful_send(target: str, message: str, payload: dict) -> None:
+    if not payload.get("success") or payload.get("error") or payload.get("skipped"):
+        return
+    if payload.get("mirrored"):
+        return
+
+    parsed = _explicit_mirror_target(target)
+    if not parsed:
+        return
+    platform_name, chat_id, thread_id = parsed
+    mirror_text = _mirror_text_for_message(message)
+    if not mirror_text:
+        return
+
+    try:
+        from gateway.mirror import mirror_to_session
+
+        mirror_to_session(
+            platform_name,
+            chat_id,
+            mirror_text,
+            source_label="cli-send",
+            thread_id=thread_id,
+        )
+    except Exception:
+        pass
 
 
 def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
@@ -357,6 +430,7 @@ def cmd_send(args: argparse.Namespace) -> None:
     }
 
     result = send_message_tool(tool_args)
+    _mirror_successful_send(target, message, _parse_result_payload(result))
     exit_code = _emit_result(
         result,
         json_mode=getattr(args, "json", False),

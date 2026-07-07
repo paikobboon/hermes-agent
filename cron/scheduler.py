@@ -764,6 +764,47 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _cron_mirror_text(cleaned_delivery_content: str, media_files: list) -> str:
+    text = (cleaned_delivery_content or "").strip()
+    if text:
+        return text
+    try:
+        from tools.send_message_tool import _describe_media_for_mirror
+
+        return _describe_media_for_mirror(media_files)
+    except Exception:
+        if not media_files:
+            return ""
+        if len(media_files) == 1:
+            return "[sent a file]"
+        return f"[sent {len(media_files)} files]"
+
+
+def _mirror_cron_delivery(
+    platform_name: str,
+    chat_id: str,
+    cleaned_delivery_content: str,
+    media_files: list,
+    *,
+    thread_id: str | None = None,
+) -> None:
+    mirror_text = _cron_mirror_text(cleaned_delivery_content, media_files)
+    if not mirror_text:
+        return
+    try:
+        from gateway.mirror import mirror_to_session
+
+        mirror_to_session(
+            platform_name,
+            chat_id,
+            mirror_text,
+            source_label="cron",
+            thread_id=thread_id,
+        )
+    except Exception:
+        pass
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1091,6 +1132,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    if not timed_out:
+                        _mirror_cron_delivery(
+                            platform_name,
+                            chat_id,
+                            cleaned_delivery_content,
+                            media_files,
+                            thread_id=thread_id,
+                        )
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
@@ -1129,6 +1178,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _mirror_cron_delivery(
+                platform_name,
+                chat_id,
+                cleaned_delivery_content,
+                media_files,
+                thread_id=thread_id,
+            )
 
     if delivery_errors:
         return "; ".join(delivery_errors)
