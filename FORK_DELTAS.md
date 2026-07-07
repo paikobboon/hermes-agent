@@ -41,3 +41,5 @@ network access for pip). Run the suite as:
 
 (or simply `./.venv/bin/pytest` if its interpreter matches). 85 tests green as
 of 2026-07-07.
+
+| `df internal` | Codex keepalive TLS-reset bypass — chatgpt.com uses SDK-default transport (NousResearch#12952) | `chatgpt.com` in _build_keepalive_http_client (run_agent.py) | manual — verify plain httpx.Client for chatgpt base_url |

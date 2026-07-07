@@ -3573,7 +3573,12 @@ class AIAgent:
             import httpx as _httpx
             import socket as _socket
 
-            if "api.githubcopilot.com" in str(base_url or "").lower():
+            # Custom keepalive transport resets the TLS handshake to the
+            # ChatGPT codex backend (NousResearch/hermes-agent#12952) and
+            # breaks Copilot too — both use the SDK-default transport.
+            # (fork delta 2026-07-07: chatgpt.com added; was Copilot-only)
+            _bl = str(base_url or "").lower()
+            if "api.githubcopilot.com" in _bl or "chatgpt.com" in _bl:
                 return _httpx.Client()
 
             _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
