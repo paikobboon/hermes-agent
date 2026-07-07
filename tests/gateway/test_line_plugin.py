@@ -506,6 +506,24 @@ class TestSendRouting:
             {"type": "sticker", "packageId": "446", "stickerId": "1988"},
         ]
 
+    def test_prebuilt_text_reply_path_parses_sticker_marker(self, adapter):
+        adapter._reply_tokens["Uchat"] = ("rt-token", time.time() + 30)
+
+        result = asyncio.run(
+            adapter._send_messages(
+                "Uchat",
+                [{"type": "text", "text": "Love you STICKER:446:1988"}],
+            )
+        )
+
+        assert result.success
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
+        assert adapter._client.reply.call_args.args[1] == [
+            {"type": "text", "text": "Love you"},
+            {"type": "sticker", "packageId": "446", "stickerId": "1988"},
+        ]
+
     def test_malformed_sticker_marker_is_left_as_text(self, adapter, caplog):
         with caplog.at_level("WARNING"):
             result = asyncio.run(adapter.send("Uchat", "Love you STICKER:abc"))
@@ -533,6 +551,8 @@ class TestQuoteContext:
         ad = LineAdapter(cfg)
         ad.sender_names = False
         ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
         ad._client.loading = AsyncMock()
         ad.handle_message = AsyncMock()
         return ad
@@ -575,6 +595,23 @@ class TestQuoteContext:
         captured = adapter.handle_message.call_args.args[0]
         assert captured.reply_to_message_id == "missing-1"
         assert captured.reply_to_text == "[quoted an earlier message]"
+
+    def test_quoted_outbound_line_message_id_resolves_from_recent_cache(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)
+        adapter._client.push.return_value = {"sentMessages": [{"id": "sent-1"}]}
+
+        result = asyncio.run(adapter.send("Uchat", "Dinner is at 6"))
+        assert result.success
+
+        asyncio.run(adapter._handle_message_event(self._event(quoted_message_id="sent-1")))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id == "sent-1"
+        assert captured.reply_to_text == "Dinner is at 6"
 
     def test_absent_quoted_message_id_leaves_reply_context_empty(self, adapter, monkeypatch):
         monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)

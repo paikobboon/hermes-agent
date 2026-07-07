@@ -750,7 +750,11 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    async def reply(
+        self,
+        reply_token: str,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -762,8 +766,17 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    return {}
+                return data if isinstance(data, dict) else {}
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def push(
+        self,
+        chat_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -775,6 +788,11 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    return {}
+                return data if isinstance(data, dict) else {}
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -916,6 +934,52 @@ def _messages_from_text_payload(content: str) -> List[Dict[str, Any]]:
 
     _append_text_messages(messages, text[last:])
     return messages[:LINE_MAX_MESSAGES_PER_CALL]
+
+
+def _messages_from_prebuilt_payload(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Normalize pre-built messages, expanding text through the shared builder."""
+    normalized: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("type") == "text":
+            normalized.extend(_messages_from_text_payload(str(message.get("text") or "")))
+        else:
+            normalized.append(message)
+    return normalized
+
+
+def _sent_message_ids(response: Any) -> List[str]:
+    if not isinstance(response, dict):
+        return []
+    sent_messages = response.get("sentMessages") or []
+    if not isinstance(sent_messages, list):
+        return []
+    ids: List[str] = []
+    for sent in sent_messages:
+        if not isinstance(sent, dict):
+            continue
+        sent_id = str(sent.get("id") or "").strip()
+        if sent_id:
+            ids.append(sent_id)
+    return ids
+
+
+def _recent_text_for_outbound_message(message: Dict[str, Any]) -> str:
+    msg_type = str(message.get("type") or "")
+    if msg_type == "text":
+        return str(message.get("text") or "").strip()
+    if msg_type == "sticker":
+        return "[sticker]"
+    if msg_type == "image":
+        return "[image]"
+    if msg_type == "video":
+        return "[video]"
+    if msg_type == "audio":
+        return "[audio]"
+    return f"[{msg_type}]" if msg_type else "[message]"
 
 
 def build_postback_button_message(
@@ -1547,6 +1611,16 @@ class LineAdapter(BasePlatformAdapter):
         while len(self._recent_message_texts) > LINE_RECENT_MESSAGE_CACHE_SIZE:
             self._recent_message_texts.popitem(last=False)
 
+    def _remember_sent_message_texts(
+        self,
+        chat_id: str,
+        response: Any,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        for sent_id, message in zip(_sent_message_ids(response), messages):
+            sent_text = _recent_text_for_outbound_message(message)
+            self._remember_recent_message_text(chat_id, sent_id, sent_text)
+
     def _resolve_quote_context(
         self,
         chat_id: str,
@@ -1746,9 +1820,10 @@ class LineAdapter(BasePlatformAdapter):
 
         try:
             if reply_token:
-                await self._client.reply(reply_token, messages)
+                response = await self._client.reply(reply_token, messages)
             else:
-                await self._client.push(chat_id, messages)
+                response = await self._client.push(chat_id, messages)
+            self._remember_sent_message_texts(chat_id, response, messages)
             self._cache.mark_delivered(request_id)
             self._pending_buttons.pop(chat_id, None)
             self._pending_delivery_tokens.pop(request_id, None)
@@ -1760,7 +1835,8 @@ class LineAdapter(BasePlatformAdapter):
                 return False
 
         try:
-            await self._client.push(chat_id, messages)
+            response = await self._client.push(chat_id, messages)
+            self._remember_sent_message_texts(chat_id, response, messages)
             self._cache.mark_delivered(request_id)
             self._pending_buttons.pop(chat_id, None)
             self._pending_delivery_tokens.pop(request_id, None)
@@ -1776,10 +1852,10 @@ class LineAdapter(BasePlatformAdapter):
         state: State,
     ) -> List[Dict[str, Any]]:
         if isinstance(payload, list):
-            return [
+            return _messages_from_prebuilt_payload([
                 message for message in payload[:LINE_MAX_MESSAGES_PER_CALL]
                 if isinstance(message, dict)
-            ]
+            ])[:LINE_MAX_MESSAGES_PER_CALL]
         text = (
             str(payload or self._select_interrupted_text())
             if state is State.ERROR
@@ -1854,14 +1930,16 @@ class LineAdapter(BasePlatformAdapter):
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, messages)
+                response = await self._client.reply(token, messages)
+                self._remember_sent_message_texts(chat_id, response, messages)
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
 
         try:
-            await self._client.push(chat_id, messages)
+            response = await self._client.push(chat_id, messages)
+            self._remember_sent_message_texts(chat_id, response, messages)
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
@@ -2176,6 +2254,7 @@ class LineAdapter(BasePlatformAdapter):
         """Send already-built message objects, batched at 5/call."""
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+        messages = _messages_from_prebuilt_payload(messages)
         if not messages:
             return SendResult(success=True, message_id=None)
 
@@ -2210,16 +2289,19 @@ class LineAdapter(BasePlatformAdapter):
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
+                response = await self._client.reply(token, first_batch)
+                self._remember_sent_message_texts(chat_id, response, first_batch)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    response = await self._client.push(chat_id, first_batch)
+                    self._remember_sent_message_texts(chat_id, response, first_batch)
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                response = await self._client.push(chat_id, first_batch)
+                self._remember_sent_message_texts(chat_id, response, first_batch)
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
 
@@ -2228,7 +2310,8 @@ class LineAdapter(BasePlatformAdapter):
             batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
             rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
             try:
-                await self._client.push(chat_id, batch)
+                response = await self._client.push(chat_id, batch)
+                self._remember_sent_message_texts(chat_id, response, batch)
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
