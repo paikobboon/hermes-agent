@@ -495,6 +495,96 @@ class TestSendRouting:
         assert "**" not in out
         assert "https://x.com" in out
 
+    def test_send_sticker_marker_sends_sticker_and_remaining_text(self, adapter):
+        result = asyncio.run(adapter.send("Uchat", "Love you STICKER:446:1988"))
+
+        assert result.success
+        adapter._client.push.assert_called_once()
+        sent_messages = adapter._client.push.call_args.args[1]
+        assert sent_messages == [
+            {"type": "text", "text": "Love you"},
+            {"type": "sticker", "packageId": "446", "stickerId": "1988"},
+        ]
+
+    def test_malformed_sticker_marker_is_left_as_text(self, adapter, caplog):
+        with caplog.at_level("WARNING"):
+            result = asyncio.run(adapter.send("Uchat", "Love you STICKER:abc"))
+
+        assert result.success
+        adapter._client.push.assert_called_once()
+        sent_messages = adapter._client.push.call_args.args[1]
+        assert sent_messages == [
+            {"type": "text", "text": "Love you STICKER:abc"},
+        ]
+        assert "malformed STICKER marker" in caplog.text
+
+
+class TestQuoteContext:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+        })
+        ad = LineAdapter(cfg)
+        ad.sender_names = False
+        ad._client = MagicMock()
+        ad._client.loading = AsyncMock()
+        ad.handle_message = AsyncMock()
+        return ad
+
+    def _event(self, message_id="msg-new", quoted_message_id=None):
+        message = {
+            "type": "text",
+            "id": message_id,
+            "text": "What did you mean?",
+        }
+        if quoted_message_id:
+            message["quotedMessageId"] = quoted_message_id
+        return {
+            "type": "message",
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "Uchat"},
+            "message": message,
+        }
+
+    def test_quoted_message_id_resolves_from_rich_sent_store(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "lookup",
+            lambda chat_id, message_id: (
+                "Dinner is at 6" if (chat_id, message_id) == ("Uchat", "quoted-1") else None
+            ),
+        )
+
+        asyncio.run(adapter._handle_message_event(self._event(quoted_message_id="quoted-1")))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id == "quoted-1"
+        assert captured.reply_to_text == "Dinner is at 6"
+
+    def test_unresolvable_quoted_message_id_uses_placeholder(self, adapter, monkeypatch):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)
+
+        asyncio.run(adapter._handle_message_event(self._event(quoted_message_id="missing-1")))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id == "missing-1"
+        assert captured.reply_to_text == "[quoted an earlier message]"
+
+    def test_absent_quoted_message_id_leaves_reply_context_empty(self, adapter, monkeypatch):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)
+
+        asyncio.run(adapter._handle_message_event(self._event()))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id is None
+        assert captured.reply_to_text is None
+
 
 # ---------------------------------------------------------------------------
 # 8. Register() metadata + plugin entry points

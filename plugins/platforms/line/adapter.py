@@ -75,6 +75,7 @@ import secrets
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -96,6 +97,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.config import Platform
+from gateway import rich_sent_store
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +125,26 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+LINE_RECENT_MESSAGE_CACHE_SIZE = 200
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
 DEFAULT_WEBHOOK_PORT = 8646
 DEFAULT_WEBHOOK_PATH = "/line/webhook"
 DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
+
+# Curated safe LINE sticker palette Lucky can reference with
+# STICKER:<packageId>:<stickerId>. These are free official LINE sticker sets:
+# 446 classic warm Brown/Cony faces (e.g. 1988), 789 friendly cheer/thanks
+# variants, and 11537 CHOCO & FRIENDS-style happy/love reactions.
+LINE_SAFE_STICKERS: Tuple[Tuple[str, str, str], ...] = (
+    ("446", "1988", "warm happy"),
+    ("446", "1990", "love"),
+    ("789", "10855", "thanks"),
+    ("789", "10863", "cheer"),
+    ("11537", "52002734", "big smile"),
+    ("11537", "52002738", "heart"),
+)
 
 # Slow-LLM postback button defaults
 DEFAULT_SLOW_RESPONSE_THRESHOLD = 45.0  # seconds; 0 disables
@@ -197,6 +213,7 @@ _MD_CODE_INLINE_RE = re.compile(r"`([^`]+)`")
 _MD_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.DOTALL)
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MD_BULLET_RE = re.compile(r"^[\s]*[-*+]\s+", re.MULTILINE)
+_STICKER_MARKER_RE = re.compile(r"(?<!\S)STICKER:([^\s:]+)(?::([^\s:]+))?")
 
 
 def strip_markdown_preserving_urls(text: str) -> str:
@@ -857,6 +874,50 @@ def _video_message(url: str, preview_url: str) -> Dict[str, Any]:
     }
 
 
+def _sticker_message(package_id: str, sticker_id: str) -> Dict[str, Any]:
+    return {
+        "type": "sticker",
+        "packageId": package_id,
+        "stickerId": sticker_id,
+    }
+
+
+def _append_text_messages(messages: List[Dict[str, Any]], text: str) -> None:
+    cleaned = strip_markdown_preserving_urls(text).strip()
+    if not cleaned:
+        return
+    for chunk in split_for_line(cleaned):
+        if len(messages) >= LINE_MAX_MESSAGES_PER_CALL:
+            return
+        messages.append(_text_message(chunk))
+
+
+def _messages_from_text_payload(content: str) -> List[Dict[str, Any]]:
+    """Build LINE messages from text plus inline ``STICKER:pkg:id`` markers."""
+    text = str(content or "")
+    messages: List[Dict[str, Any]] = []
+    last = 0
+
+    for match in _STICKER_MARKER_RE.finditer(text):
+        package_id = match.group(1) or ""
+        sticker_id = match.group(2) or ""
+        if not (package_id.isdigit() and sticker_id.isdigit()):
+            logger.warning(
+                "LINE: malformed STICKER marker %r; leaving as text",
+                match.group(0),
+            )
+            continue
+
+        _append_text_messages(messages, text[last:match.start()])
+        if len(messages) >= LINE_MAX_MESSAGES_PER_CALL:
+            return messages[:LINE_MAX_MESSAGES_PER_CALL]
+        messages.append(_sticker_message(package_id, sticker_id))
+        last = match.end()
+
+    _append_text_messages(messages, text[last:])
+    return messages[:LINE_MAX_MESSAGES_PER_CALL]
+
+
 def build_postback_button_message(
     text: str, button_label: str, request_id: str
 ) -> Dict[str, Any]:
@@ -1123,6 +1184,7 @@ class LineAdapter(BasePlatformAdapter):
         self._dedup = _MessageDeduplicator(persist_path=_dedup_state)
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
+        self._recent_message_texts: "OrderedDict[str, str]" = OrderedDict()
 
         # Media state
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
@@ -1451,6 +1513,8 @@ class LineAdapter(BasePlatformAdapter):
             chat_name=chat_name,
         )
 
+        reply_to_id, reply_to_text = self._resolve_quote_context(chat_id, msg)
+
         event_obj = MessageEvent(
             text=text,
             message_type=message_type,
@@ -1459,9 +1523,53 @@ class LineAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
+            reply_to_message_id=reply_to_id,
+            reply_to_text=reply_to_text,
         )
 
+        self._remember_recent_message_text(chat_id, message_id, text)
         await self.handle_message(event_obj)
+
+    def _recent_message_key(self, chat_id: str, message_id: str) -> str:
+        return f"{chat_id}:{message_id}"
+
+    def _remember_recent_message_text(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+    ) -> None:
+        if not chat_id or not message_id or not text:
+            return
+        key = self._recent_message_key(chat_id, message_id)
+        self._recent_message_texts[key] = text[:2000]
+        self._recent_message_texts.move_to_end(key)
+        while len(self._recent_message_texts) > LINE_RECENT_MESSAGE_CACHE_SIZE:
+            self._recent_message_texts.popitem(last=False)
+
+    def _resolve_quote_context(
+        self,
+        chat_id: str,
+        msg: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        quoted_id = str(msg.get("quotedMessageId") or "").strip()
+        if not quoted_id:
+            return None, None
+
+        quoted_text: Optional[str] = None
+        try:
+            quoted_text = rich_sent_store.lookup(chat_id, quoted_id)
+        except Exception as exc:
+            logger.debug("LINE: rich quote lookup failed for %s: %s", quoted_id, exc)
+
+        if not quoted_text:
+            quoted_text = self._recent_message_texts.get(
+                self._recent_message_key(chat_id, quoted_id)
+            )
+
+        if not quoted_text:
+            quoted_text = "[quoted an earlier message]"
+        return quoted_id, quoted_text
 
     # ------------------------------------------------------------------
     # Sender / chat identity resolution
@@ -1677,8 +1785,7 @@ class LineAdapter(BasePlatformAdapter):
             if state is State.ERROR
             else str(payload or "")
         )
-        chunks = split_for_line(strip_markdown_preserving_urls(text))
-        return [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+        return _messages_from_text_payload(text)
 
     async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
         if not self._client or not message_id:
@@ -1740,10 +1847,9 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
-        chunks = split_for_line(strip_markdown_preserving_urls(content))
-        if not chunks:
+        messages = _messages_from_text_payload(content)
+        if not messages:
             return SendResult(success=True, message_id=None)
-        messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
