@@ -1820,31 +1820,24 @@ class LineAdapter(BasePlatformAdapter):
             messages = [_text_message("")]
 
         logger.info("LINE SEND site=cached kind=%s chat=%s n=%d", "reply" if reply_token else "push", chat_id, len(messages))
+        # A reactive answer is FREE-reply-only: pushing behind the button's back
+        # defeats the button (Pai's rule, 2026-07-08). Without a live reply token
+        # we keep the answer cached (READY) so the next press delivers it free.
+        if not reply_token:
+            self._cache.release_delivery_claim(request_id, previous_state)
+            return False
         try:
-            if reply_token:
-                response = await self._client.reply(reply_token, messages)
-            else:
-                response = await self._client.push(chat_id, messages)
+            response = await self._client.reply(reply_token, messages)
             self._remember_sent_message_texts(chat_id, response, messages)
             self._cache.mark_delivered(request_id)
             self._pending_buttons.pop(chat_id, None)
             self._pending_delivery_tokens.pop(request_id, None)
             return True
         except Exception as exc:
-            logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
-            if not reply_token:
-                self._cache.release_delivery_claim(request_id, previous_state)
-                return False
-
-        try:
-            response = await self._client.push(chat_id, messages)
-            self._remember_sent_message_texts(chat_id, response, messages)
-            self._cache.mark_delivered(request_id)
-            self._pending_buttons.pop(chat_id, None)
-            self._pending_delivery_tokens.pop(request_id, None)
-            return True
-        except Exception as exc2:
-            logger.error("LINE: postback push fallback failed: %s", exc2)
+            logger.warning(
+                "LINE: postback reply failed (%s); keeping cached for next press (no push)",
+                exc,
+            )
             self._cache.release_delivery_claim(request_id, previous_state)
             return False
 
@@ -1912,8 +1905,23 @@ class LineAdapter(BasePlatformAdapter):
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
-            await self._deliver_registered_pending_response(pending_rid)
-            return SendResult(success=True, message_id=pending_rid)
+            if await self._deliver_registered_pending_response(pending_rid):
+                return SendResult(success=True, message_id=pending_rid)
+            # The button is the delivery contract: if the answer can't go out as
+            # a FREE reply yet (no press / token expired), keep it cached behind
+            # the live button and never push. The press delivers it. (Pai, 2026-07-08)
+            entry = self._cache.get(pending_rid)
+            if entry is not None and entry.state in {State.READY, State.ERROR}:
+                return SendResult(success=True, message_id=pending_rid)
+            # Stale button (already delivered): clear so we don't swallow this
+            # fresh answer, then fall through to the normal path.
+            logger.warning(
+                "LINE: stale pending-button rid=%s for chat %s; clearing",
+                pending_rid, chat_id,
+            )
+            self._cache.mark_delivered(pending_rid)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(pending_rid, None)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
 
@@ -2270,6 +2278,11 @@ class LineAdapter(BasePlatformAdapter):
                 messages[:LINE_MAX_MESSAGES_PER_CALL],
             )
             if await self._deliver_registered_pending_response(pending_rid):
+                return SendResult(success=True, message_id=pending_rid)
+            # Live button (answer READY, awaiting a press): keep cached, never
+            # push — the press is the delivery contract (Pai, 2026-07-08).
+            entry = self._cache.get(pending_rid)
+            if entry is not None and entry.state in {State.READY, State.ERROR}:
                 return SendResult(success=True, message_id=pending_rid)
             # Stale button rid (no registered press, tokens expired, or the
             # payload claim was already spent): do NOT swallow the send.

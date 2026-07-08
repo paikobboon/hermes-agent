@@ -952,3 +952,45 @@ class TestMessageTypeMapping:
     def test_unknown_type_falls_back_to_text(self):
         MessageType = _line.MessageType
         assert _line._LINE_MESSAGE_TYPES.get("flex", MessageType.TEXT) == MessageType.TEXT
+
+
+
+class TestNeverPushBehindButton:
+    """Reactive answers behind a slow-LLM button are delivered ONLY by a press
+    (free reply). They are never pushed behind the button's back. (Pai, 2026-07-08)."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={"channel_access_token": "tok", "channel_secret": "sec"})
+        ad = LineAdapter(cfg)
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        return ad
+
+    def test_expired_delivery_token_never_pushes(self, adapter):
+        import time as _time
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        # User pressed earlier, but that reply token has since expired.
+        adapter._pending_delivery_tokens[rid] = ("Uchat", "old-token", _time.time() - 1)
+        result = asyncio.run(adapter.send("Uchat", "the answer"))
+        assert result.success
+        adapter._client.push.assert_not_called()   # never push behind the button
+        adapter._client.reply.assert_not_called()  # expired token can't reply
+        assert adapter._cache.get(rid).state is State.READY  # waits for the next press
+        assert adapter._cache.get(rid).payload == "the answer"
+
+    def test_press_with_valid_token_replies_free(self, adapter):
+        import time as _time
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        adapter._cache.set_ready(rid, "the answer")
+        adapter._pending_delivery_tokens[rid] = ("Uchat", "fresh-token", _time.time() + 30)
+        ok = asyncio.run(adapter._deliver_registered_pending_response(rid))
+        assert ok
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
