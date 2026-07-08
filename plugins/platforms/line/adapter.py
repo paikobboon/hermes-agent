@@ -1819,6 +1819,7 @@ class LineAdapter(BasePlatformAdapter):
         if not messages:
             messages = [_text_message("")]
 
+        logger.info("LINE SEND site=cached kind=%s chat=%s n=%d", "reply" if reply_token else "push", chat_id, len(messages))
         try:
             if reply_token:
                 response = await self._client.reply(reply_token, messages)
@@ -1931,6 +1932,7 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         token, used_reply = self._consume_reply_token(chat_id)
+        logger.info("LINE SEND site=text kind=%s chat=%s n=%d", "reply" if (used_reply and not force_push) else "push", chat_id, len(messages))
         if used_reply and not force_push:
             try:
                 response = await self._client.reply(token, messages)
@@ -2290,6 +2292,7 @@ class LineAdapter(BasePlatformAdapter):
 
         # First batch: try reply token, fall back to push.
         token, used_reply = self._consume_reply_token(chat_id)
+        logger.info("LINE SEND site=prebuilt kind=%s chat=%s n=%d", "reply" if used_reply else "push", chat_id, len(messages))
         if used_reply:
             try:
                 response = await self._client.reply(token, first_batch)
