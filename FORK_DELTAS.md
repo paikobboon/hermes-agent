@@ -46,3 +46,4 @@ network access for pip). Run the suite as:
 of 2026-07-07.
 
 | `df internal` | Codex keepalive TLS-reset bypass — chatgpt.com uses SDK-default transport (NousResearch#12952) | `chatgpt.com` in _build_keepalive_http_client (run_agent.py) | manual — verify plain httpx.Client for chatgpt base_url |
+| `local` | LINE inbound video/audio-file/document discard fix — non-image media was cached via image-only `cache_image_from_bytes`, which refuses non-image bytes, so a valid MP4 was fetched then thrown away and the family saw a bare `[video]` with no file/metadata. New `cache_media_from_bytes` saves non-image bytes (size still validated); adapter routes images→image cache, video/audio/file→media cache | `cache_media_from_bytes` in `gateway/platforms/base.py`; `_download_media` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_media_download_retry.py::TestCacheMediaFromBytes` (2 cases) |

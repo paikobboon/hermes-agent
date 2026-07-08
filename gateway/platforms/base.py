@@ -716,6 +716,31 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     return str(filepath)
 
 
+def cache_media_from_bytes(data: bytes, ext: str = ".bin", *, media_type: str = "file") -> str:
+    """
+    Save raw non-image media bytes (video/audio/file) to the cache and return
+    the absolute file path.
+
+    Unlike :func:`cache_image_from_bytes`, this does NOT require the payload to
+    look like an image -- LINE videos, audio clips, and document attachments are
+    legitimately non-image binaries. Inbound size is still validated.
+
+    Args:
+        data: Raw media bytes.
+        ext:  File extension including the dot (e.g. ".mp4", ".m4a", ".bin").
+        media_type: Label used in size-limit error messages.
+
+    Returns:
+        Absolute path to the cached media file as a string.
+    """
+    validate_inbound_media_size(len(data), media_type=media_type)
+    cache_dir = get_image_cache_dir()
+    filename = f"media_{uuid.uuid4().hex[:12]}{ext}"
+    filepath = cache_dir / filename
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
 async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
     """
     Download an image from a URL and save it to the local cache.
