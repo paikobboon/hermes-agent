@@ -400,55 +400,9 @@ class DeliveryRouter:
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
         
-        # Guard: handle oversized cron output.
-        #
-        # Two independent decisions:
-        #   1. AUDIT SAVE — when content exceeds MAX_PLATFORM_OUTPUT, the full
-        #      output is always written to disk as a recoverable audit trail.
-        #      This fires regardless of adapter capability (best-effort).
-        #   2. TRUNCATION — for non-chunking adapters, content above the cap is
-        #      truncated with a footer pointing to the saved file.  Chunking-
-        #      capable adapters (splits_long_messages=True) receive the full
-        #      payload and split natively in their send().
         job_id = (metadata or {}).get("job_id", "unknown")
         saved_path: Optional[Path] = None
-
-        if len(content) > MAX_PLATFORM_OUTPUT:
-            # Step 1 — audit save (best-effort).  The save is a side-effect
-            # audit trail, not essential to delivery.  If it fails (full disk,
-            # permissions), delivery proceeds — the content reaches the adapter
-            # regardless.
-            try:
-                saved_path = self._save_full_output(content, job_id)
-            except OSError as exc:
-                logger.warning(
-                    "Audit save failed for cron output (%d chars, job=%s): %s — "
-                    "delivery proceeds without audit copy",
-                    len(content), job_id, exc,
-                )
-
-            # Step 2 — truncation (only for non-chunking adapters).
-            if getattr(adapter, "splits_long_messages", False):
-                # Adapter chunks natively — deliver full payload.
-                if saved_path:
-                    logger.info(
-                        "Cron output preserved for chunking adapter (%d chars) — "
-                        "full output saved to %s",
-                        len(content), saved_path,
-                    )
-            else:
-                # Non-chunking adapter — truncate with footer.  The footer
-                # needs a valid path, so if the best-effort save above failed,
-                # retry it here (a failure now is a real delivery problem).
-                if saved_path is None:
-                    saved_path = self._save_full_output(content, job_id)
-                footer = f"\n\n... [truncated, full output saved to {saved_path}]"
-                visible = max(0, MAX_PLATFORM_OUTPUT - len(footer))
-                logger.info(
-                    "Cron output truncated (%d chars) — full output: %s",
-                    len(content), saved_path,
-                )
-                content = content[:visible] + footer
+        original_content = content
         
         # Substrate-level anti-loop guard: drop hallucinated "silence narration"
         # (*(silent)*, 🔇, a bare ".", etc.) before it ever reaches the adapter.
@@ -524,6 +478,76 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
+
+        media_methods = (
+            "assemble_and_send_media",
+            "extract_media",
+            "extract_images",
+            "extract_local_files",
+            "send_multiple_images",
+            "send_image_file",
+        )
+        media_delivery_supported = all(
+            callable(getattr(adapter, method, None)) for method in media_methods
+        )
+        if media_delivery_supported:
+            content = await adapter.assemble_and_send_media(
+                chat_id=target.chat_id,
+                content=content,
+                metadata=send_metadata or None,
+            )
+
+        # Guard: handle oversized cron output.
+        #
+        # Two independent decisions:
+        #   1. AUDIT SAVE — when the raw or cleaned content exceeds
+        #      MAX_PLATFORM_OUTPUT, the full original output is always written
+        #      to disk as a recoverable audit trail. This fires regardless of
+        #      adapter capability (best-effort).
+        #   2. TRUNCATION — for non-chunking adapters, cleaned text above the
+        #      cap is truncated with a footer pointing to the saved file.
+        #      Chunking-capable adapters (splits_long_messages=True) receive
+        #      the full cleaned payload and split natively in their send().
+        needs_audit_save = (
+            len(original_content) > MAX_PLATFORM_OUTPUT
+            or len(content) > MAX_PLATFORM_OUTPUT
+        )
+        if needs_audit_save:
+            try:
+                saved_path = self._save_full_output(original_content, job_id)
+            except OSError as exc:
+                logger.warning(
+                    "Audit save failed for cron output (%d chars, job=%s): %s — "
+                    "delivery proceeds without audit copy",
+                    len(original_content), job_id, exc,
+                )
+
+            if len(content) > MAX_PLATFORM_OUTPUT:
+                if getattr(adapter, "splits_long_messages", False):
+                    if saved_path:
+                        logger.info(
+                            "Cron output preserved for chunking adapter (%d chars) — "
+                            "full output saved to %s",
+                            len(content), saved_path,
+                        )
+                else:
+                    if saved_path is None:
+                        saved_path = self._save_full_output(original_content, job_id)
+                    footer = f"\n\n... [truncated, full output saved to {saved_path}]"
+                    visible = max(0, MAX_PLATFORM_OUTPUT - len(footer))
+                    logger.info(
+                        "Cron output truncated (%d chars) — full output: %s",
+                        len(content), saved_path,
+                    )
+                    content = content[:visible] + footer
+
+        if not content.strip():
+            return {
+                "success": True,
+                "delivered": bool(media_delivery_supported),
+                "media_only": bool(media_delivery_supported),
+            }
+
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
         if _send_result_failed(result):
             if (
@@ -551,7 +575,3 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
-
-
