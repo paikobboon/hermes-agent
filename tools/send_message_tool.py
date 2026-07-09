@@ -610,6 +610,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
     if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
         return target_ref, None, True
+    # LINE native target IDs are opaque but prefixed by target type:
+    # U... user, C... group, R... room. Treat these as explicit chat IDs so
+    # `hermes send -t line:<id>` does not depend on channel-directory lookup.
+    if platform_name == "line" and len(target_ref) > 1 and target_ref[0] in {"U", "C", "R"}:
+        return target_ref, None, True
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
