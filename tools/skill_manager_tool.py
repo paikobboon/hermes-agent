@@ -410,6 +410,25 @@ def _background_review_read_before_write_guard(
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
+    # Pai, 2026-07-10: autonomous skill mutation by the background review is
+    # DISABLED on this profile -- it created a rogue skill that broke a live
+    # feature and fought every human fix. Skills are human-edited only. Block
+    # ALL skill writes (incl. create) when this is the background-review fork.
+    # Pinned by test_background_review_cannot_create_or_mutate_skills.
+    try:
+        from tools.skill_provenance import is_background_review
+        if is_background_review() and action in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+            return {
+                "success": False,
+                "error": (
+                    "Refusing background-review skill '%s' on '%s': autonomous skill "
+                    "mutation is disabled on this profile. Skills are edited by humans only."
+                    % (action, name)
+                ),
+                "_fail_closed": True,
+            }
+    except Exception:
+        pass
     if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     existing = _find_skill(name)
