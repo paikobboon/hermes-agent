@@ -1,0 +1,72 @@
+# FORK DELTAS
+
+## 2026-07-09 — Migrated onto upstream v0.18.2 (origin/main `daedf4f62`; +2252 commits)
+
+Fork reconciled onto upstream by Theo, test-gated (401 passed, 0 failed; `test_media_dedupe` incident A/B green). Pre-migration state preserved at branch `pre-migrate-20260709` (@ `6be3a7a71`, pushed to fork remote). Disposition of the 22 pre-migration deltas:
+
+- **DROPPED (obsolete / superseded upstream):**
+  - codex keepalive TLS bypass — upstream rewrote the transport and removed the custom socket-options client globally, citing the same issue #12952. (Do NOT re-add a chatgpt early-return; it would strip upstream's new proxy/pool handling.)
+  - `hermes send` CLI `_mirror_successful_send` fallback + its 2 tests — upstream send-tool mirror covers CLI sends.
+  - unconditional cron mirror — upstream's gated `_maybe_mirror_cron_delivery` adopted instead.
+  - delivery.py `assemble_and_send_media` restructure + run.py media one-liner — redundant on upstream (upstream cron assembles media natively; `DeliveryRouter.deliver` is never called). The duplicate-image "one file, one delivery" fix is carried by the egress guard, proven by `test_media_dedupe` incident A/B staying green without them.
+- **ADOPTED UPSTREAM:** send_message tool session-mirror; cron delivery mirror (opt-in) — REQUIRES `cron.mirror_delivery: true`, now set in the lucky profile config, else cron briefs stop landing in-chat.
+- **RE-APPLIED (surviving fork behaviors, each pinned by a ported test):** all LINE adapter features (sender-name + media/text coalescing, `STICKER:` markers, quoted-reply context, per-profile slow-response copy + rotating, postback pull-model button, cache accumulate-text+image, mobile <=1MB JPEG preview) — adapter.py was ~clean vs upstream; base.py media egress guard (8.0s TTL, content-aware mtime/size) + `dedupe_delivery_paths` + `cache_media_from_bytes`; `line:U/C/R` explicit target parse; weixin dedupe one-liner; `extract_local_files` line-aware bare-path cleanup.
+- **FOLLOW-UP:** aiohttp runtime pin is 3.13.4; upstream security-bumped to 3.14.1 (CVE/RCE). Needs a runtime-venv (pip-less `./venv`) update — tracked separately, not a boot blocker.
+
+Below: the original pre-migration per-delta ledger, retained for lineage (anchors now point at pre-migration code; use the reconciliation commits `origin/main..fork/line-group-upgrades` for the current re-apply anchors).
+
+---
+
+# FORK_DELTAS — paikobboon/hermes-agent · branch `fork/line-group-upgrades`
+
+> Ledger of every behavior this fork carries on top of upstream (NousResearch).
+> Doctrine (LifeOS upstream-upgrade-safety): each delta gets a lineage note, a
+> re-apply anchor (a stable string to find/re-locate it after rebases), and a
+> pinning test. `scripts/ops/upgrade-hermes.sh` (in the lucky-profile repo)
+> rebases this branch onto upstream and REFUSES to proceed unless the pinning
+> tests pass. Update this ledger in the same commit as any new delta.
+>
+> Upstream is fetch-only: push URLs on `origin` are deliberately dead, and
+> `gh pr/issue create` + `*nousresearch*` are deny-listed in every profile.
+
+## Deltas (2026-07-06/07 hardening wave)
+
+| Commit | What | Re-apply anchor | Pinning test |
+|---|---|---|---|
+| `47815c890` | Slow-response strings configurable per profile (pending/button/delivered/interrupted; env + `extra:` keys) | `DEFAULT_PENDING_REPLY_TEXT` constants + `_text_setting(` reads in `plugins/platforms/line/adapter.py` | `test_line_plugin.py` (config-string cases) |
+| `aadaff3d3` | Rotating copy (plural list keys, `random.choice` per send) + postback double-press dedupe (per-rid `DELIVERING` claim) | `pending_reply_texts` / `DELIVERING` in `plugins/platforms/line/adapter.py` | `test_line_plugin.py::` rotation + double-press cases |
+| `41b97b1f4` | Stale pending-button rid can no longer swallow sends: honor delivery result, tombstone payload, fall through to reply/push, WARN | `"pending-button delivery unavailable for rid"` in `plugins/platforms/line/adapter.py` `_send_messages` | covered via double-press/pending cases; live WARNING observed 2026-07-07 00:13 |
+| `7f6afaa84` | Cross-lane media dedupe — one file, one delivery. Shared `dedupe_delivery_paths(*groups)` (strip `file://`, URL-decode, expanduser, realpath; first-wins; shape-preserving) applied at base.py outbound assembly (×2), run.py queued path (×2), weixin.py direct send | `def dedupe_delivery_paths` in `gateway/platforms/base.py` | `tests/gateway/test_media_dedupe.py` (4 cases) |
+| `local` | Media egress guard — per-chat 90s TTL invariant closes duplicate image delivery at the outbound boundary; LINE local image sends share the guard before public URL registration; dedupe removals log `cross-lane dedupe: N -> M` | `media egress guard` in `gateway/platforms/base.py` | `tests/gateway/test_media_dedupe.py` incident A/B assembly replays + TTL boundary case |
+| `local` | Cron/scheduled platform delivery now runs the shared interactive media assembly before the final text send: generated image/file paths are attached natively, markdown image wrappers are stripped, cleaned text is sent only when non-empty, and raw oversized output still gets an audit copy | `assemble_and_send_media` call in `DeliveryRouter._deliver_to_platform` (`gateway/delivery.py`) | `tests/gateway/test_delivery.py::test_cron_delivery_attaches_bare_image_path_and_sends_cleaned_text`; `tests/gateway/test_delivery.py::test_cron_delivery_attaches_markdown_image_once_and_strips_wrapper` |
+| `local` | Proactive cross-chat sends are mirrored into the target session so Lucky remembers what she sent there: `hermes send` has a guarded CLI fallback that skips already-mirrored tool sends, `line:U/C/R...` targets parse as explicit IDs, and cron mirrors confirmed live-adapter/standalone deliveries after cleaning `MEDIA:` tags | `_mirror_successful_send(` in `hermes_cli/send_cmd.py`; `platform_name == "line"` in `tools/send_message_tool.py`; `_mirror_cron_delivery(` in `cron/scheduler.py` | `tests/hermes_cli/test_send_cmd.py::test_successful_explicit_send_fallback_mirrors_target_session`; `tests/hermes_cli/test_send_cmd.py::test_successful_send_does_not_double_mirror_when_tool_already_did_it`; `tests/tools/test_send_message_target_parse.py::test_line_user_id_target_is_explicit`; `tests/cron/test_scheduler.py::TestDeliverResultWrapping::test_successful_delivery_mirrors_to_target_session`; `tests/cron/test_scheduler.py::TestDeliverResultWrapping::test_failed_delivery_does_not_mirror_to_target_session` |
+| `local` | LINE sticker send without a new agent tool: outbound text may include `STICKER:<packageId>:<stickerId>`, valid numeric markers are stripped into native LINE sticker messages, malformed markers remain text with a warning, and Lucky has a curated safe sticker palette constant. Fixed follow-up: pre-built text messages on the primary reply/push path now converge through `_messages_from_text_payload`, so normal agent replies, pushes, cached-button delivery, and CLI sends share the same text-to-LINE-message builder instead of leaking raw markers. | `_messages_from_text_payload` / `_messages_from_prebuilt_payload` / `LINE_SAFE_STICKERS` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestSendRouting::test_send_sticker_marker_sends_sticker_and_remaining_text`; `tests/gateway/test_line_plugin.py::TestSendRouting::test_prebuilt_text_reply_path_parses_sticker_marker`; `tests/gateway/test_line_plugin.py::TestSendRouting::test_malformed_sticker_marker_is_left_as_text` |
+| `local` | LINE standalone out-of-process send lane missed the STICKER convergence sweep: `hermes send -t line:...` now uses the shared text payload builder so valid `STICKER:<packageId>:<stickerId>` markers become native sticker messages instead of leaking as literal text. | `_standalone_send` payload build in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestStandaloneSend::test_standalone_send_parses_sticker_markers` |
+| `local` | LINE quoted-reply context: inbound `message.quotedMessageId` populates `reply_to_message_id` and `reply_to_text` from `rich_sent_store` or a bounded recent-message cache, with a placeholder when unresolved so Lucky sees the user is replying to an earlier message. Fixed follow-up: successful LINE reply/push responses cache outbound `sentMessages[].id` back to the sent text or media placeholder, so quoting Lucky's own messages resolves too. | `_resolve_quote_context` / `_remember_sent_message_texts` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestQuoteContext::test_quoted_message_id_resolves_from_rich_sent_store`; `tests/gateway/test_line_plugin.py::TestQuoteContext::test_quoted_outbound_line_message_id_resolves_from_recent_cache`; `tests/gateway/test_line_plugin.py::TestQuoteContext::test_unresolvable_quoted_message_id_uses_placeholder`; `tests/gateway/test_line_plugin.py::TestQuoteContext::test_absent_quoted_message_id_leaves_reply_context_empty` |
+
+## Pre-wave deltas (Pai-era, before 2026-07-06)
+
+The branch also carries earlier LINE work (sender display-name resolution,
+media/text coalescing, webhook-event dedupe persistence, sticker/coalesce
+tests, group upgrades). Snapshot them any time with:
+
+    git log --oneline origin/main..fork/line-group-upgrades
+
+When touching any of these, add them to the table above with an anchor + test.
+
+## Test infra note
+
+`pytest` lives in `./.venv` (NOT `./venv`, which is the runtime venv and has no
+network access for pip). Run the suite as:
+
+    PYTHONPATH=$(ls -d .venv/lib/python*/site-packages) ./venv/bin/python -m pytest tests/gateway/test_line_plugin.py tests/gateway/test_media_dedupe.py -q
+
+(or simply `./.venv/bin/pytest` if its interpreter matches). 85 tests green as
+of 2026-07-07.
+
+| `df internal` | Codex keepalive TLS-reset bypass — chatgpt.com uses SDK-default transport (NousResearch#12952) | `chatgpt.com` in _build_keepalive_http_client (run_agent.py) | manual — verify plain httpx.Client for chatgpt base_url |
+| `local` | LINE inbound video/audio-file/document discard fix — non-image media was cached via image-only `cache_image_from_bytes`, which refuses non-image bytes, so a valid MP4 was fetched then thrown away and the family saw a bare `[video]` with no file/metadata. New `cache_media_from_bytes` saves non-image bytes (size still validated); adapter routes images→image cache, video/audio/file→media cache | `cache_media_from_bytes` in `gateway/platforms/base.py`; `_download_media` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_media_download_retry.py::TestCacheMediaFromBytes` (2 cases) |
+| `local` | Reactive answers are FREE-reply-only — never push behind the slow-LLM button. When a slow answer can't go out as a free reply (no press yet / reply token expired), it stays cached (READY) behind the live button and is delivered only on the user's press; the three push-fallback branches were removed. Proactive/cron sends and no-button error paths still push. Stale-button anti-swallow preserved via a cache-state (READY/ERROR) liveness check. | `_deliver_cached_response`, `send`, `_send_prebuilt` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestNeverPushBehindButton` (2 cases) |
+| `local` | Slow-turn image silently dropped from the postback cache: a slow turn emits its text then its image as two separate `set_ready` calls on the same button id; the PENDING-only guard made the second (image) call a no-op, so a postback tap delivered text only and the family never saw the picture ("ยังไม่เห็นเลย"). `set_ready` now ACCUMULATES: a second payload on a READY entry is normalized and merged into one message list (capped at 5), so a single FREE-reply press delivers text+image together — still no push, consistent with the never-push-behind-button rule above. | `set_ready` accumulate + `_normalize_cached_payload` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestRequestCache::test_set_ready_accumulates_multiple_payloads` |
+| `local` | Slow-LLM postback button -> Pai's PULL model (2026-07-09): a tap while the answer is still generating now replies the predefined "not done yet" text on that tap's OWN fresh reply token. Was: the first tap silently stashed the token + returned nothing (only the 2nd tap acked), and the stashed 50s token expired on slow (40-260s) image gens so the "deliver when ready" promise silently failed. Now: no stashing, no proactive push/reply on completion -- the finished answer caches READY and the NEXT tap delivers text+image in one free reply (dedup preserved by the DELIVERING claim). Also: cached path no longer logs a misleading "kind=push" when it holds-without-sending. | `_handle_postback_event` PENDING branch + `_deliver_cached_response` log in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestSendRouting::test_pending_tap_always_replies_not_done` + `::test_pending_taps_reply_not_done_then_next_tap_delivers` |
+| `local` | LINE image preview fix (2026-07-09): generated images (multi-MB gpt-image PNGs) were reused as BOTH originalContentUrl AND previewImageUrl, but LINE caps previewImageUrl at 1 MB (original 10 MB). LINE MOBILE renders the preview thumbnail and shows BLANK when it is >1 MB (desktop loads the original directly) -- so images appeared on laptop but not phones. `send_image_file` now builds a downscaled (<=1024px) JPEG thumbnail <=1 MB via new `_generate_line_preview` (Pillow, temp file, cleanup=True) and passes it as previewImageUrl; the full PNG stays originalContentUrl. Falls back to the original URL if Pillow is unavailable. | `_generate_line_preview` + `send_image_file` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestLinePreview::test_preview_is_small_jpeg_distinct_from_source` (importorskip PIL in the mixed test runner; runtime-verified 4.5MB PNG -> 0.64MB JPEG) |
