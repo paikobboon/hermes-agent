@@ -1047,3 +1047,21 @@ class TestNeverPushBehindButton:
         assert ok
         adapter._client.reply.assert_called_once()
         adapter._client.push.assert_not_called()
+
+
+class TestLinePreview:
+    def test_preview_is_small_jpeg_distinct_from_source(self, tmp_path):
+        import pytest, os as _os
+        Image = pytest.importorskip("PIL.Image")
+        # A full multi-MB PNG reused as LINE's previewImageUrl (>1 MB) renders
+        # blank on the mobile app. _generate_line_preview must return a small
+        # (<=1 MB) JPEG thumbnail, distinct from the source.
+        src = tmp_path / "big.png"
+        Image.frombytes("RGB", (1254, 1254), _os.urandom(1254 * 1254 * 3)).save(src, "PNG")
+        assert src.stat().st_size > 1_048_576, "source PNG should exceed 1 MB"
+        preview = _line._generate_line_preview(str(src))
+        assert preview is not None and preview != str(src)
+        assert _os.path.getsize(preview) <= 1_000_000, "preview must be <= 1 MB"
+        with open(preview, "rb") as fh:
+            assert fh.read(3) == b"\xff\xd8\xff", "preview must be JPEG"
+        _os.unlink(preview)

@@ -894,6 +894,38 @@ def _image_message(original_url: str, preview_url: Optional[str] = None) -> Dict
     }
 
 
+def _generate_line_preview(
+    src_path: str, *, max_dim: int = 1024, max_bytes: int = 1_000_000
+) -> Optional[str]:
+    """Small JPEG preview for LINE's previewImageUrl (LINE caps it at 1 MB).
+    The LINE MOBILE app renders this thumbnail and fails on an oversized
+    preview (desktop loads the original instead), so a multi-MB PNG reused
+    as the preview shows blank on phones. Returns a temp .jpg path
+    (<= max_bytes), or None on any failure so the caller falls back to the
+    original URL. FORK DELTA 2026-07-09.
+    """
+    try:
+        from PIL import Image
+        import tempfile
+    except Exception:
+        return None
+    try:
+        with Image.open(src_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            fd, tmp = tempfile.mkstemp(suffix=".jpg", prefix="line_preview_")
+            os.close(fd)
+            for quality, dim in ((85, max_dim), (70, max_dim), (60, 512), (50, 384)):
+                if dim != max_dim:
+                    im.thumbnail((dim, dim), Image.LANCZOS)
+                im.save(tmp, format="JPEG", quality=quality, optimize=True)
+                if os.path.getsize(tmp) <= max_bytes:
+                    return tmp
+            return tmp
+    except Exception:
+        return None
+
+
 def _audio_message(url: str, duration_ms: int = 1000) -> Dict[str, Any]:
     return {
         "type": "audio",
@@ -2220,7 +2252,16 @@ class LineAdapter(BasePlatformAdapter):
         url = self._media_url(token, path.name)
         if not url.lower().startswith("https://"):
             return SendResult(success=False, error=f"LINE image URL must be HTTPS: {url}")
-        msgs: List[Dict[str, Any]] = [_image_message(url)]
+        # LINE caps previewImageUrl at 1 MB; a full multi-MB PNG reused as the
+        # preview renders BLANK on the LINE mobile app (desktop loads the
+        # original directly). Generate a small JPEG thumbnail for the preview
+        # so phones render it; fall back to the original URL if Pillow can't.
+        preview_url = url
+        _preview_path = _generate_line_preview(str(path.resolve()))
+        if _preview_path:
+            _preview_token = self._register_media(_preview_path, cleanup=True)
+            preview_url = self._media_url(_preview_token, os.path.basename(_preview_path))
+        msgs: List[Dict[str, Any]] = [_image_message(url, preview_url)]
         if caption:
             msgs.append(_text_message(caption))
         return await self._send_messages(chat_id, msgs)
