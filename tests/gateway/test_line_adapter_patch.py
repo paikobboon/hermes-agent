@@ -58,6 +58,8 @@ class _FakeMessageEvent:
     message_id: str
     media_urls: List[str] = field(default_factory=list)
     media_types: List[str] = field(default_factory=list)
+    reply_to_message_id: Optional[str] = None
+    reply_to_text: Optional[str] = None
 
 
 @dataclass
@@ -69,6 +71,10 @@ class _FakeSendResult:
 
 def _fake_cache_image_from_bytes(data: bytes, ext: str = ".bin") -> str:
     return f"/fake/cached{ext}"
+
+
+def _fake_cache_media_from_bytes(data: bytes, ext: str = ".bin", *, media_type: str = "file") -> str:
+    return f"/fake/cached_media{ext}"
 
 
 class _FakeBasePlatformAdapter:
@@ -117,6 +123,7 @@ def _install_fake_gateway() -> None:
     base_mod.MessageType = _FakeMessageType
     base_mod.SendResult = _FakeSendResult
     base_mod.cache_image_from_bytes = _fake_cache_image_from_bytes
+    base_mod.cache_media_from_bytes = _fake_cache_media_from_bytes
 
     config_mod = types.ModuleType("gateway.config")
     config_mod.Platform = _FakePlatform
@@ -126,6 +133,9 @@ def _install_fake_gateway() -> None:
     gateway_mod = types.ModuleType("gateway")
     gateway_mod.platforms = platforms_mod
     gateway_mod.config = config_mod
+    rich_sent_store_mod = types.ModuleType("gateway.rich_sent_store")
+    rich_sent_store_mod.lookup = lambda *a, **k: None
+    gateway_mod.rich_sent_store = rich_sent_store_mod
 
     # Force the fakes in even if a real ``gateway`` is importable (e.g. when
     # run inside the hermes-agent tree) — the adapter-under-test must bind to
@@ -134,16 +144,38 @@ def _install_fake_gateway() -> None:
     sys.modules["gateway.platforms"] = platforms_mod
     sys.modules["gateway.platforms.base"] = base_mod
     sys.modules["gateway.config"] = config_mod
+    sys.modules["gateway.rich_sent_store"] = rich_sent_store_mod
 
 
 def _load_adapter_module():
-    _install_fake_gateway()
-    path = Path(__file__).with_name("adapter.py")
-    spec = importlib.util.spec_from_file_location("line_adapter_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    # Isolate the fake-gateway install: save any real gateway modules,
+    # install fakes, load the adapter (which binds its imports to the fakes
+    # at import time), then restore sys.modules so the fakes never leak into
+    # other test modules collected in the same session (see this dir's
+    # conftest anti-pattern note).
+    _modnames = [
+        "gateway",
+        "gateway.platforms",
+        "gateway.platforms.base",
+        "gateway.config",
+        "gateway.rich_sent_store",
+    ]
+    _saved = {name: sys.modules.get(name) for name in _modnames}
+    try:
+        _install_fake_gateway()
+        # Load the real LINE plugin adapter by its actual path.
+        path = Path(__file__).resolve().parents[2] / "plugins" / "platforms" / "line" / "adapter.py"
+        spec = importlib.util.spec_from_file_location("line_adapter_under_test", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, mod in _saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
 
 
 adapter_mod = _load_adapter_module()
