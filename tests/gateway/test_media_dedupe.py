@@ -64,12 +64,16 @@ async def _deliver_response_through_base_assembly(adapter: _RecordingAdapter, re
     await adapter._process_message_background(event, session_key)
 
 
-def _sent_image_paths(adapter: _RecordingAdapter) -> list[str]:
-    prefix = "🖼️ Image: "
+def _sent_image_deliveries(adapter: _RecordingAdapter) -> list[dict]:
+    # Upstream rewrote the base send_image_file fallback to a fixed notice
+    # that no longer echoes the host path (host-path-leak fix), so delivered
+    # content can no longer recover the path. Cross-lane dedupe correctness
+    # is a per-file DELIVERY COUNT property: assert on how many image
+    # deliveries were emitted, not on parsed path strings.
     return [
-        entry["content"][len(prefix):]
+        entry
         for entry in adapter.sent
-        if entry["content"].startswith(prefix)
+        if "Couldn't deliver the image attachment" in entry["content"]
     ]
 
 
@@ -141,7 +145,7 @@ async def test_incident_a_media_tag_and_bare_path_emit_once_through_outbound_ass
         f"Here is the image:\nMEDIA:{artifact}\n{artifact}",
     )
 
-    assert _sent_image_paths(adapter) == [str(artifact)]
+    assert len(_sent_image_deliveries(adapter)) == 1
 
 
 @pytest.mark.asyncio
@@ -157,7 +161,7 @@ async def test_incident_b_two_distinct_files_preserved_when_one_repeated_through
         f"MEDIA:{first}\n{second}\n{first}",
     )
 
-    assert _sent_image_paths(adapter) == [str(first), str(second)]
+    assert len(_sent_image_deliveries(adapter)) == 2
 
 
 @pytest.mark.asyncio
@@ -176,11 +180,11 @@ async def test_media_egress_guard_suppresses_duplicate_within_ttl_and_allows_aft
 
     assert first.success is True
     assert second.success is True
-    assert _sent_image_paths(adapter) == [str(artifact)]
+    assert len(_sent_image_deliveries(adapter)) == 1
     assert "media egress guard: suppressed duplicate" in caplog.text
 
     now += 9.0
     third = await adapter.send_image_file("chat-guard", str(artifact))
 
     assert third.success is True
-    assert _sent_image_paths(adapter) == [str(artifact), str(artifact)]
+    assert len(_sent_image_deliveries(adapter)) == 2
