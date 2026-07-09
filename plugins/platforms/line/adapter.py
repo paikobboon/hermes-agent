@@ -69,14 +69,16 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import secrets
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
@@ -93,8 +95,10 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     cache_image_from_bytes,
+    cache_media_from_bytes,
 )
 from gateway.config import Platform
+from gateway import rich_sent_store
 
 
 # ---------------------------------------------------------------------------
@@ -107,17 +111,41 @@ LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
 
+# Identity resolution endpoints (sender display names + group titles).
+LINE_GROUP_MEMBER_URL_FMT = (
+    "https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+)
+LINE_ROOM_MEMBER_URL_FMT = (
+    "https://api.line.me/v2/bot/room/{room_id}/member/{user_id}"
+)
+LINE_PROFILE_URL_FMT = "https://api.line.me/v2/bot/profile/{user_id}"
+LINE_GROUP_SUMMARY_URL_FMT = "https://api.line.me/v2/bot/group/{group_id}/summary"
+
 # LINE Messaging API hard limits
 LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+LINE_RECENT_MESSAGE_CACHE_SIZE = 200
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
 DEFAULT_WEBHOOK_PORT = 8646
 DEFAULT_WEBHOOK_PATH = "/line/webhook"
 DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
+
+# Curated safe LINE sticker palette Lucky can reference with
+# STICKER:<packageId>:<stickerId>. These are free official LINE sticker sets:
+# 446 classic warm Brown/Cony faces (e.g. 1988), 789 friendly cheer/thanks
+# variants, and 11537 CHOCO & FRIENDS-style happy/love reactions.
+LINE_SAFE_STICKERS: Tuple[Tuple[str, str, str], ...] = (
+    ("446", "1988", "warm happy"),
+    ("446", "1990", "love"),
+    ("789", "10855", "thanks"),
+    ("789", "10863", "cheer"),
+    ("11537", "52002734", "big smile"),
+    ("11537", "52002738", "heart"),
+)
 
 # Slow-LLM postback button defaults
 DEFAULT_SLOW_RESPONSE_THRESHOLD = 45.0  # seconds; 0 disables
@@ -132,6 +160,23 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+
+# Sender/chat identity resolution
+SENDER_NAME_CACHE_TTL_SECONDS = 6 * 3600  # 6h; display names rarely change
+SENDER_NAME_HTTP_TIMEOUT_SECONDS = 10.0  # bounded — resolution must not hang dispatch
+
+# Media→text coalescing. LINE has no image captions, so a user sends an image
+# and then explains it in a follow-up text 1–5s later. Without coalescing the
+# adapter dispatches two disjoint turns and the agent answers the bare image
+# before the caption lands. A MEDIA message opens a short buffer; TEXT (and
+# further media) from the same sender merge into one MessageEvent.
+DEFAULT_COALESCE_MEDIA_GRACE = 4.0  # seconds a lone media waits for a caption
+DEFAULT_COALESCE_IDLE = 2.5         # window extension per merged message
+DEFAULT_COALESCE_MAX_AGE = 7.0      # hard cap from the first buffered event
+
+# Inbound message types that open/extend a coalescing buffer. Audio (voice
+# notes), stickers, and locations are self-contained turns — they never buffer.
+_COALESCE_MEDIA_TYPES: Set[str] = {"image", "video", "file"}
 
 # Map LINE webhook message types to the normalized MessageType the gateway
 # routes on. LINE has no separate "voice" type — audio messages are recorded
@@ -169,6 +214,7 @@ _MD_CODE_INLINE_RE = re.compile(r"`([^`]+)`")
 _MD_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.DOTALL)
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MD_BULLET_RE = re.compile(r"^[\s]*[-*+]\s+", re.MULTILINE)
+_STICKER_MARKER_RE = re.compile(r"(?<!\S)STICKER:([^\s:]+)(?::([^\s:]+))?")
 
 
 def strip_markdown_preserving_urls(text: str) -> str:
@@ -283,6 +329,7 @@ def verify_line_signature(body: bytes, signature: str, channel_secret: str) -> b
 class State(enum.Enum):
     PENDING = "pending"  # button sent, LLM still running
     READY = "ready"      # LLM done, response cached, waiting for postback tap
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
     ERROR = "error"      # LLM raised / interrupted; cached error text waiting
 
@@ -323,11 +370,28 @@ class RequestCache:
 
     def set_ready(self, request_id: str, payload: Any) -> None:
         entry = self._entries.get(request_id)
-        if entry is None or entry.state is not State.PENDING:
+        if entry is None:
             return
-        entry.state = State.READY
-        entry.payload = payload
-        entry.updated_at = time.time()
+        # FORK DELTA 2026-07-09 (lucky image-drop fix): a slow turn emits its
+        # text and its image as two separate adapter sends, each calling
+        # set_ready on the same pending button id. The original guard fired
+        # only on PENDING, so the second payload (the image) hit a READY
+        # entry and was silently dropped -- a tap then delivered text only.
+        # Accumulate instead so one press delivers the whole answer.
+        # DELIVERING/DELIVERED/ERROR stay terminal (no resurrection).
+        # Pinned by test_set_ready_accumulates_multiple_payloads.
+        if entry.state is State.PENDING:
+            entry.state = State.READY
+            entry.payload = payload
+            entry.updated_at = time.time()
+            return
+        if entry.state is State.READY:
+            entry.payload = (
+                _normalize_cached_payload(entry.payload)
+                + _normalize_cached_payload(payload)
+            )[:LINE_MAX_MESSAGES_PER_CALL]
+            entry.updated_at = time.time()
+            return
 
     def set_error(self, request_id: str, message: str) -> None:
         entry = self._entries.get(request_id)
@@ -339,9 +403,26 @@ class RequestCache:
 
     def mark_delivered(self, request_id: str) -> None:
         entry = self._entries.get(request_id)
-        if entry is None or entry.state not in {State.READY, State.ERROR}:
+        if entry is None or entry.state not in {State.READY, State.ERROR, State.DELIVERING}:
             return
         entry.state = State.DELIVERED
+        entry.updated_at = time.time()
+
+    def claim_delivery(self, request_id: str) -> Optional[Tuple[State, Any]]:
+        entry = self._entries.get(request_id)
+        if entry is None or entry.state not in {State.READY, State.ERROR}:
+            return None
+        previous_state = entry.state
+        payload = entry.payload
+        entry.state = State.DELIVERING
+        entry.updated_at = time.time()
+        return previous_state, payload
+
+    def release_delivery_claim(self, request_id: str, previous_state: State) -> None:
+        entry = self._entries.get(request_id)
+        if entry is None or entry.state is not State.DELIVERING:
+            return
+        entry.state = previous_state
         entry.updated_at = time.time()
 
     def find_pending_for_chat(self, chat_id: str) -> Optional[str]:
@@ -371,11 +452,36 @@ class RequestCache:
 # ---------------------------------------------------------------------------
 
 class _MessageDeduplicator:
-    """Bounded LRU of LINE webhook event IDs to ignore at-least-once retries."""
+    """Bounded LRU of LINE webhook event IDs to ignore at-least-once retries.
 
-    def __init__(self, max_size: int = 1000) -> None:
+    Optionally persists the seen-set to disk so redeliveries that straddle a
+    gateway restart (LINE webhook-redelivery is at-least-once) are still
+    recognized by the fresh process.
+    """
+
+    def __init__(self, max_size: int = 1000, persist_path: Optional[str] = None) -> None:
         self._seen: Dict[str, float] = {}
         self._max = max_size
+        self._persist_path = persist_path
+        if persist_path:
+            try:
+                with open(persist_path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    self._seen = {str(k): float(v) for k, v in loaded.items()}
+            except (FileNotFoundError, ValueError, OSError):
+                pass  # first run or unreadable state: start empty
+
+    def _persist(self) -> None:
+        if not self._persist_path:
+            return
+        try:
+            tmp = self._persist_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._seen, fh)
+            os.replace(tmp, self._persist_path)
+        except OSError:
+            pass  # persistence is best-effort; never break dispatch
 
     def is_duplicate(self, event_id: str) -> bool:
         if not event_id:
@@ -387,7 +493,211 @@ class _MessageDeduplicator:
             cutoff = sorted(self._seen.values())[len(self._seen) // 10 or 1]
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
         self._seen[event_id] = time.time()
+        self._persist()
         return False
+
+
+# ---------------------------------------------------------------------------
+# Media→text coalescing
+# ---------------------------------------------------------------------------
+
+# Signature of the callable the coalescer invokes to emit a finished turn.
+# Kept LINE-shaped but adapter-agnostic so the coalescer is unit-testable
+# without a live gateway: pass any async callable and inspect what it receives.
+CoalesceDispatch = Callable[..., Awaitable[None]]
+
+
+@dataclass
+class _CoalesceBuffer:
+    """One in-flight (chat_id, user_id) turn awaiting possible follow-ups."""
+
+    key: Tuple[str, str]
+    latest_event: Dict[str, Any]      # freshest raw event → freshest replyToken
+    message_id: str                    # id of the FIRST buffered media message
+    placeholder: str                   # original ``[image]`` text, used if no caption
+    media_urls: List[str] = field(default_factory=list)
+    media_types: List[str] = field(default_factory=list)
+    texts: List[str] = field(default_factory=list)  # real captions, newline-joined
+    created_at: float = field(default_factory=time.monotonic)
+    timer: Optional["asyncio.Task[None]"] = None
+    timer_token: int = 0               # guards against stale timer flushes
+
+
+class _MediaCoalescer:
+    """Sliding-window batcher that fuses a media message with the text that
+    explains it into a single dispatched turn.
+
+    Rules (see module patch notes):
+
+    * Only a MEDIA message opens a buffer, held ``grace`` seconds.
+    * TEXT from the same sender while a buffer is open merges in and extends
+      the window by ``idle`` (captions join with newlines).
+    * Further MEDIA from the same sender merges its urls/types and extends too.
+    * ``max_age`` from the first buffered event is a hard flush cap.
+    * TEXT with no open buffer dispatches immediately (zero added latency).
+    * A different sender or chat never merges — separate key, separate buffer.
+
+    Concurrency: a single adapter-level lock guards all buffer state (LINE
+    traffic is low, so one lock is simpler and provably correct). Timers run
+    as tasks; a per-buffer token makes a woken timer a no-op if it was
+    superseded by a merge, so we never double-flush or leak a stale flush.
+    """
+
+    def __init__(
+        self,
+        dispatch: CoalesceDispatch,
+        *,
+        grace: float,
+        idle: float,
+        max_age: float,
+    ) -> None:
+        self._dispatch = dispatch
+        self._grace = max(0.0, grace)
+        self._idle = max(0.0, idle)
+        self._max_age = max(0.0, max_age)
+        self._buffers: Dict[Tuple[str, str], _CoalesceBuffer] = {}
+        self._lock = asyncio.Lock()
+
+    def has_buffer(self, key: Tuple[str, str]) -> bool:
+        return key in self._buffers
+
+    async def submit_media(
+        self,
+        key: Tuple[str, str],
+        raw_event: Dict[str, Any],
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+        message_id: str,
+    ) -> None:
+        """Open a new buffer for a lone media message, or merge into an open one."""
+        flush_event: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            buf = self._buffers.get(key)
+            if buf is None:
+                buf = _CoalesceBuffer(
+                    key=key,
+                    latest_event=raw_event,
+                    message_id=message_id,
+                    placeholder=text,
+                    media_urls=list(media_urls),
+                    media_types=list(media_types),
+                )
+                self._buffers[key] = buf
+                # The initial grace window is still bounded by the hard cap so
+                # a grace > max_age misconfiguration can't defeat the cap.
+                self._schedule(key, min(self._grace, self._max_age))
+            else:
+                buf.media_urls.extend(media_urls)
+                buf.media_types.extend(media_types)
+                buf.latest_event = raw_event
+                flush_event = self._extend_or_flush(key)
+        if flush_event is not None:
+            await self._safe_dispatch(flush_event)
+
+    async def submit_text(
+        self,
+        key: Tuple[str, str],
+        raw_event: Dict[str, Any],
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+        message_id: str,
+    ) -> None:
+        """Merge a caption into an open buffer, or dispatch the text immediately."""
+        dispatch_kwargs: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            buf = self._buffers.get(key)
+            if buf is None:
+                # No media pending — plain text must gain zero latency.
+                dispatch_kwargs = dict(
+                    raw_event=raw_event,
+                    text=text,
+                    media_urls=list(media_urls),
+                    media_types=list(media_types),
+                    message_id=message_id,
+                )
+            else:
+                if text:
+                    buf.texts.append(text)
+                buf.latest_event = raw_event
+                dispatch_kwargs = self._extend_or_flush(key)
+        if dispatch_kwargs is not None:
+            await self._safe_dispatch(dispatch_kwargs)
+
+    async def flush_all(self) -> None:
+        """Immediately flush every pending buffer — for adapter shutdown."""
+        pending: List[Dict[str, Any]] = []
+        async with self._lock:
+            for key in list(self._buffers.keys()):
+                buf = self._buffers.pop(key)
+                self._cancel_timer(buf)
+                pending.append(self._build_flush_kwargs(buf))
+        for kwargs in pending:
+            await self._safe_dispatch(kwargs)
+
+    async def _safe_dispatch(self, kwargs: Dict[str, Any]) -> None:
+        """Dispatch outside the lock; downstream failures are logged, never
+        raised. Timer flushes run in detached tasks, where an uncaught
+        exception is a silently dropped user turn — the exact failure class
+        this patch exists to remove."""
+        try:
+            await self._dispatch(**kwargs)
+        except Exception:
+            logger.exception("LINE: coalesced dispatch failed")
+
+    # -- internals (all callers below hold ``self._lock``) ------------------
+
+    def _extend_or_flush(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        """Reschedule the buffer's timer, or return flush kwargs if the hard
+        cap is already reached. Caller dispatches the returned kwargs outside
+        the lock."""
+        buf = self._buffers[key]
+        now = time.monotonic()
+        hard_remaining = (buf.created_at + self._max_age) - now
+        if hard_remaining <= 0:
+            self._cancel_timer(buf)
+            del self._buffers[key]
+            return self._build_flush_kwargs(buf)
+        self._schedule(key, min(self._idle, hard_remaining))
+        return None
+
+    def _schedule(self, key: Tuple[str, str], delay: float) -> None:
+        buf = self._buffers[key]
+        self._cancel_timer(buf)
+        buf.timer_token += 1
+        token = buf.timer_token
+        buf.timer = asyncio.create_task(self._flush_after(key, max(0.0, delay), token))
+
+    @staticmethod
+    def _cancel_timer(buf: _CoalesceBuffer) -> None:
+        if buf.timer is not None and not buf.timer.done():
+            buf.timer.cancel()
+        buf.timer = None
+
+    async def _flush_after(self, key: Tuple[str, str], delay: float, token: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        kwargs: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            buf = self._buffers.get(key)
+            if buf is None or buf.timer_token != token:
+                return  # superseded by a merge or already flushed
+            del self._buffers[key]
+            kwargs = self._build_flush_kwargs(buf)
+        await self._safe_dispatch(kwargs)
+
+    def _build_flush_kwargs(self, buf: _CoalesceBuffer) -> Dict[str, Any]:
+        text = "\n".join(buf.texts) if buf.texts else buf.placeholder
+        return dict(
+            raw_event=buf.latest_event,
+            text=text,
+            media_urls=list(buf.media_urls),
+            media_types=list(buf.media_types),
+            message_id=buf.message_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +768,11 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    async def reply(
+        self,
+        reply_token: str,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -470,8 +784,17 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    return {}
+                return data if isinstance(data, dict) else {}
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def push(
+        self,
+        chat_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -483,6 +806,11 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    return {}
+                return data if isinstance(data, dict) else {}
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -527,6 +855,25 @@ class _LineClient:
         except Exception:
             return None
 
+    async def get_json(
+        self, url: str, *, timeout: float = SENDER_NAME_HTTP_TIMEOUT_SECONDS
+    ) -> Optional[Dict[str, Any]]:
+        """GET a LINE JSON endpoint. Fail-open: any error/non-2xx → ``None``.
+
+        Used for identity lookups (member profiles, group summaries) where a
+        failure must degrade to the raw id rather than block message handling.
+        """
+        import aiohttp
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=client_timeout, trust_env=True) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    return await resp.json()
+        except Exception:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Message builders
@@ -547,6 +894,38 @@ def _image_message(original_url: str, preview_url: Optional[str] = None) -> Dict
     }
 
 
+def _generate_line_preview(
+    src_path: str, *, max_dim: int = 1024, max_bytes: int = 1_000_000
+) -> Optional[str]:
+    """Small JPEG preview for LINE's previewImageUrl (LINE caps it at 1 MB).
+    The LINE MOBILE app renders this thumbnail and fails on an oversized
+    preview (desktop loads the original instead), so a multi-MB PNG reused
+    as the preview shows blank on phones. Returns a temp .jpg path
+    (<= max_bytes), or None on any failure so the caller falls back to the
+    original URL. FORK DELTA 2026-07-09.
+    """
+    try:
+        from PIL import Image
+        import tempfile
+    except Exception:
+        return None
+    try:
+        with Image.open(src_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            fd, tmp = tempfile.mkstemp(suffix=".jpg", prefix="line_preview_")
+            os.close(fd)
+            for quality, dim in ((85, max_dim), (70, max_dim), (60, 512), (50, 384)):
+                if dim != max_dim:
+                    im.thumbnail((dim, dim), Image.LANCZOS)
+                im.save(tmp, format="JPEG", quality=quality, optimize=True)
+                if os.path.getsize(tmp) <= max_bytes:
+                    return tmp
+            return tmp
+    except Exception:
+        return None
+
+
 def _audio_message(url: str, duration_ms: int = 1000) -> Dict[str, Any]:
     return {
         "type": "audio",
@@ -561,6 +940,110 @@ def _video_message(url: str, preview_url: str) -> Dict[str, Any]:
         "originalContentUrl": url,
         "previewImageUrl": preview_url,
     }
+
+
+def _sticker_message(package_id: str, sticker_id: str) -> Dict[str, Any]:
+    return {
+        "type": "sticker",
+        "packageId": package_id,
+        "stickerId": sticker_id,
+    }
+
+
+def _append_text_messages(messages: List[Dict[str, Any]], text: str) -> None:
+    cleaned = strip_markdown_preserving_urls(text).strip()
+    if not cleaned:
+        return
+    for chunk in split_for_line(cleaned):
+        if len(messages) >= LINE_MAX_MESSAGES_PER_CALL:
+            return
+        messages.append(_text_message(chunk))
+
+
+def _messages_from_text_payload(content: str) -> List[Dict[str, Any]]:
+    """Build LINE messages from text plus inline ``STICKER:pkg:id`` markers."""
+    text = str(content or "")
+    messages: List[Dict[str, Any]] = []
+    last = 0
+
+    for match in _STICKER_MARKER_RE.finditer(text):
+        package_id = match.group(1) or ""
+        sticker_id = match.group(2) or ""
+        if not (package_id.isdigit() and sticker_id.isdigit()):
+            logger.warning(
+                "LINE: malformed STICKER marker %r; leaving as text",
+                match.group(0),
+            )
+            continue
+
+        _append_text_messages(messages, text[last:match.start()])
+        if len(messages) >= LINE_MAX_MESSAGES_PER_CALL:
+            return messages[:LINE_MAX_MESSAGES_PER_CALL]
+        messages.append(_sticker_message(package_id, sticker_id))
+        last = match.end()
+
+    _append_text_messages(messages, text[last:])
+    return messages[:LINE_MAX_MESSAGES_PER_CALL]
+
+
+def _messages_from_prebuilt_payload(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Normalize pre-built messages, expanding text through the shared builder."""
+    normalized: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("type") == "text":
+            normalized.extend(_messages_from_text_payload(str(message.get("text") or "")))
+        else:
+            normalized.append(message)
+    return normalized
+
+def _normalize_cached_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Coerce a cached postback payload -- plain text (str) or a prebuilt
+    message list -- into a list of LINE message dicts, so multiple slow-turn
+    sends (text + image) merge into one delivery instead of clobbering.
+    FORK DELTA 2026-07-09.
+    """
+    if isinstance(payload, list):
+        return _messages_from_prebuilt_payload(
+            [m for m in payload if isinstance(m, dict)]
+        )
+    if payload is None:
+        return []
+    return _messages_from_text_payload(str(payload))
+
+
+def _sent_message_ids(response: Any) -> List[str]:
+    if not isinstance(response, dict):
+        return []
+    sent_messages = response.get("sentMessages") or []
+    if not isinstance(sent_messages, list):
+        return []
+    ids: List[str] = []
+    for sent in sent_messages:
+        if not isinstance(sent, dict):
+            continue
+        sent_id = str(sent.get("id") or "").strip()
+        if sent_id:
+            ids.append(sent_id)
+    return ids
+
+
+def _recent_text_for_outbound_message(message: Dict[str, Any]) -> str:
+    msg_type = str(message.get("type") or "")
+    if msg_type == "text":
+        return str(message.get("text") or "").strip()
+    if msg_type == "sticker":
+        return "[sticker]"
+    if msg_type == "image":
+        return "[image]"
+    if msg_type == "video":
+        return "[video]"
+    if msg_type == "audio":
+        return "[audio]"
+    return f"[{msg_type}]" if msg_type else "[message]"
 
 
 def build_postback_button_message(
@@ -585,11 +1068,11 @@ def build_postback_button_message(
             "actions": [
                 {
                     "type": "postback",
-                    "label": button_label[:20] or "Get answer",
+                    "label": button_label[:20] or DEFAULT_BUTTON_LABEL,
                     "data": json.dumps(
                         {"action": "show_response", "request_id": request_id}
                     ),
-                    "displayText": button_label[:300] or "Get answer",
+                    "displayText": button_label[:300] or DEFAULT_BUTTON_LABEL,
                 }
             ],
         },
@@ -629,6 +1112,68 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _float_setting(env_name: str, extra_value: Any, default: float) -> float:
+    """Resolve a float from env, then the ``extra`` config, then ``default``.
+
+    Any unparseable value at either layer falls back to ``default`` rather
+    than raising — a bad knob must never take the adapter down.
+    """
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = extra_value
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text_setting(env_name: str, extra_value: Any, default: str) -> str:
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = extra_value
+    if raw is None:
+        return default
+    value = str(raw).strip()
+    return value or default
+
+
+def _text_choices(
+    env_name: str,
+    plural_value: Any,
+    singular_value: Any,
+    default: str,
+) -> List[str]:
+    raw = os.getenv(env_name)
+    if raw is not None:
+        value = str(raw).strip()
+        return [value or default]
+
+    for candidate in (plural_value, singular_value):
+        choices = _coerce_text_choices(candidate)
+        if choices:
+            return choices
+    return [default]
+
+
+def _coerce_text_choices(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    value = str(raw).strip()
+    return [value] if value else []
+
+
+def _choose_text(choices: List[str], default: str) -> str:
+    if not choices:
+        return default
+    if len(choices) == 1:
+        return choices[0]
+    return random.choice(choices)
 
 
 # ---------------------------------------------------------------------------
@@ -698,22 +1243,60 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.slow_response_threshold = DEFAULT_SLOW_RESPONSE_THRESHOLD
 
-        # User-overridable copy
-        self.pending_text = (
-            os.getenv("LINE_PENDING_TEXT")
-            or extra.get("pending_text", DEFAULT_PENDING_REPLY_TEXT)
+        # Per-profile slow-response copy; plural YAML list keys take precedence.
+        # LINE button labels hard-cap at 20 chars when each chosen label is sent.
+        self.pending_reply_texts = _text_choices(
+            "LINE_PENDING_REPLY_TEXT",
+            extra.get("pending_reply_texts"),
+            extra.get("pending_reply_text"),
+            DEFAULT_PENDING_REPLY_TEXT,
         )
-        self.button_label = (
-            os.getenv("LINE_BUTTON_LABEL")
-            or extra.get("button_label", DEFAULT_BUTTON_LABEL)
+        self.pending_reply_text = self.pending_reply_texts[0]
+        self.pending_button_labels = _text_choices(
+            "LINE_PENDING_BUTTON_LABEL",
+            extra.get("pending_button_labels"),
+            extra.get("pending_button_label"),
+            DEFAULT_BUTTON_LABEL,
         )
-        self.delivered_text = (
-            os.getenv("LINE_DELIVERED_TEXT")
-            or extra.get("delivered_text", DEFAULT_DELIVERED_TEXT)
+        self.pending_button_label = self.pending_button_labels[0]
+        self.delivered_texts = _text_choices(
+            "LINE_DELIVERED_TEXT",
+            extra.get("delivered_texts"),
+            extra.get("delivered_text"),
+            DEFAULT_DELIVERED_TEXT,
         )
-        self.interrupted_text = (
-            os.getenv("LINE_INTERRUPTED_TEXT")
-            or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
+        self.delivered_text = self.delivered_texts[0]
+        self.interrupted_texts = _text_choices(
+            "LINE_INTERRUPTED_TEXT",
+            extra.get("interrupted_texts"),
+            extra.get("interrupted_text"),
+            DEFAULT_INTERRUPTED_TEXT,
+        )
+        self.interrupted_text = self.interrupted_texts[0]
+
+        # Sender/chat identity resolution (group chats need "who is speaking").
+        self.sender_names = _truthy_env(
+            "LINE_SENDER_NAMES", bool(extra.get("sender_names", True))
+        )
+
+        # Media→text coalescing knobs.
+        self.coalesce_media = _truthy_env(
+            "LINE_COALESCE_MEDIA", bool(extra.get("coalesce_media", True))
+        )
+        self.coalesce_media_grace = _float_setting(
+            "LINE_COALESCE_MEDIA_GRACE",
+            extra.get("coalesce_media_grace"),
+            DEFAULT_COALESCE_MEDIA_GRACE,
+        )
+        self.coalesce_idle = _float_setting(
+            "LINE_COALESCE_IDLE",
+            extra.get("coalesce_idle"),
+            DEFAULT_COALESCE_IDLE,
+        )
+        self.coalesce_max_age = _float_setting(
+            "LINE_COALESCE_MAX_AGE",
+            extra.get("coalesce_max_age"),
+            DEFAULT_COALESCE_MAX_AGE,
         )
 
         # Runtime state
@@ -723,9 +1306,13 @@ class LineAdapter(BasePlatformAdapter):
         self._site = None  # aiohttp.web.TCPSite
         self._reply_tokens: Dict[str, Tuple[str, float]] = {}  # chat_id → (token, expiry)
         self._cache = RequestCache()
-        self._dedup = _MessageDeduplicator()
+        _dedup_state = os.path.join(os.path.expanduser("~/.hermes/profiles/lucky/state"), "line_dedup.json") if os.path.isdir(os.path.expanduser("~/.hermes/profiles/lucky")) else None
+        if _dedup_state:
+            os.makedirs(os.path.dirname(_dedup_state), exist_ok=True)
+        self._dedup = _MessageDeduplicator(persist_path=_dedup_state)
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
+        self._recent_message_texts: "OrderedDict[str, str]" = OrderedDict()
 
         # Media state
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
@@ -735,6 +1322,19 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+        self._pending_delivery_tokens: Dict[str, Tuple[str, str, float]] = {}
+
+        # Identity-resolution cache: key → (resolved_name, expiry). Keys are
+        # namespaced by lookup kind (member/profile/group summary).
+        self._name_cache: Dict[str, Tuple[str, float]] = {}
+
+        # Media→text coalescer. Emits finished turns through _dispatch_coalesced.
+        self._coalescer = _MediaCoalescer(
+            self._dispatch_coalesced,
+            grace=self.coalesce_media_grace,
+            idle=self.coalesce_idle,
+            max_age=self.coalesce_max_age,
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -823,6 +1423,13 @@ class LineAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
+
+        # Flush any pending coalescing buffers before teardown so a buffered
+        # media+caption turn is never silently dropped on shutdown.
+        try:
+            await self._coalescer.flush_all()
+        except Exception as exc:
+            logger.debug("LINE: coalescer flush on disconnect failed: %s", exc)
 
         if self._site is not None:
             try:
@@ -973,25 +1580,223 @@ class LineAdapter(BasePlatformAdapter):
         if chat_type == "dm" and self._client:
             asyncio.create_task(self._client.loading(chat_id))
 
+        # Route through the media→text coalescer when enabled. MEDIA opens or
+        # extends a buffer; TEXT merges into an open buffer (else dispatches
+        # immediately). Self-contained turns (sticker/location/audio/unknown)
+        # bypass the buffer entirely and never disturb a pending one.
+        if self.coalesce_media:
+            key = (chat_id, user_id)
+            if msg_type in _COALESCE_MEDIA_TYPES:
+                await self._coalescer.submit_media(
+                    key, event, text, media_urls, media_types, message_id
+                )
+                return
+            if msg_type == "text":
+                await self._coalescer.submit_text(
+                    key, event, text, media_urls, media_types, message_id
+                )
+                return
+
+        await self._dispatch_coalesced(
+            raw_event=event,
+            text=text,
+            media_urls=media_urls,
+            media_types=media_types,
+            message_id=message_id,
+        )
+
+    async def _dispatch_coalesced(
+        self,
+        *,
+        raw_event: Dict[str, Any],
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+        message_id: str,
+    ) -> None:
+        """Build the final ``MessageEvent`` (resolving sender/chat identity)
+        and hand it to the gateway. Single builder for every dispatch path —
+        immediate, coalesced flush, and shutdown flush."""
+        msg = raw_event.get("message") or {}
+        msg_type = msg.get("type", "")
+        source = raw_event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        user_id = source.get("userId", "") or chat_id
+
+        user_name = await self._resolve_sender_name(source, user_id)
+        chat_name = await self._resolve_chat_name(source, chat_id, chat_type)
+
+        # A coalesced image+caption must route as PHOTO (so vision fires), not
+        # as the TEXT type of whichever event happened to arrive last.
+        if media_types:
+            message_type = _LINE_MESSAGE_TYPES.get(media_types[0], MessageType.TEXT)
+        else:
+            message_type = _LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT)
+
         source_obj = self.build_source(
             chat_id=chat_id,
             chat_type=chat_type,
             user_id=user_id,
-            user_name=user_id,
-            chat_name=chat_id,
+            user_name=user_name,
+            chat_name=chat_name,
         )
+
+        reply_to_id, reply_to_text = self._resolve_quote_context(chat_id, msg)
 
         event_obj = MessageEvent(
             text=text,
-            message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
+            message_type=message_type,
             source=source_obj,
-            raw_message=event,
+            raw_message=raw_event,
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
+            reply_to_message_id=reply_to_id,
+            reply_to_text=reply_to_text,
         )
 
+        self._remember_recent_message_text(chat_id, message_id, text)
         await self.handle_message(event_obj)
+
+    def _recent_message_key(self, chat_id: str, message_id: str) -> str:
+        return f"{chat_id}:{message_id}"
+
+    def _remember_recent_message_text(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+    ) -> None:
+        if not chat_id or not message_id or not text:
+            return
+        key = self._recent_message_key(chat_id, message_id)
+        self._recent_message_texts[key] = text[:2000]
+        self._recent_message_texts.move_to_end(key)
+        while len(self._recent_message_texts) > LINE_RECENT_MESSAGE_CACHE_SIZE:
+            self._recent_message_texts.popitem(last=False)
+
+    def _remember_sent_message_texts(
+        self,
+        chat_id: str,
+        response: Any,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        for sent_id, message in zip(_sent_message_ids(response), messages):
+            sent_text = _recent_text_for_outbound_message(message)
+            self._remember_recent_message_text(chat_id, sent_id, sent_text)
+
+    def _resolve_quote_context(
+        self,
+        chat_id: str,
+        msg: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        quoted_id = str(msg.get("quotedMessageId") or "").strip()
+        if not quoted_id:
+            return None, None
+
+        quoted_text: Optional[str] = None
+        try:
+            quoted_text = rich_sent_store.lookup(chat_id, quoted_id)
+        except Exception as exc:
+            logger.debug("LINE: rich quote lookup failed for %s: %s", quoted_id, exc)
+
+        if not quoted_text:
+            quoted_text = self._recent_message_texts.get(
+                self._recent_message_key(chat_id, quoted_id)
+            )
+
+        if not quoted_text:
+            quoted_text = "[quoted an earlier message]"
+        return quoted_id, quoted_text
+
+    # ------------------------------------------------------------------
+    # Sender / chat identity resolution
+    # ------------------------------------------------------------------
+
+    def _prune_name_cache(self) -> None:
+        """Drop expired identity entries opportunistically (mirrors the
+        _media_tokens eviction idiom — no background sweeper)."""
+        now = time.time()
+        for cache_key in list(self._name_cache.keys()):
+            if self._name_cache[cache_key][1] <= now:
+                self._name_cache.pop(cache_key, None)
+
+    async def _cached_lookup(self, cache_key: str, url: str, field_name: str) -> Optional[str]:
+        """Return ``field_name`` from ``url`` (via cache), or ``None`` on any
+        miss/error. Successful lookups are cached for the TTL; failures are
+        not cached, so a transient error retries on the next message."""
+        self._prune_name_cache()
+        cached = self._name_cache.get(cache_key)
+        if cached is not None and cached[1] > time.time():
+            return cached[0]
+        if not self._client:
+            return None
+        data = await self._client.get_json(url)
+        if not data:
+            return None
+        value = data.get(field_name)
+        if not value:
+            return None
+        self._name_cache[cache_key] = (value, time.time() + SENDER_NAME_CACHE_TTL_SECONDS)
+        return value
+
+    async def _resolve_sender_name(self, source: Dict[str, Any], user_id: str) -> str:
+        """Resolve a sender's LINE display name, fail-open to the raw id.
+
+        In group/room chats the raw ``U…`` id tells the agent nothing about
+        who is speaking. We resolve it via the member/profile API, cache the
+        result ~6h, and on any error fall back to the id so message handling
+        is never blocked.
+        """
+        if not self.sender_names or not user_id:
+            return user_id
+        src_type = (source or {}).get("type", "")
+        if src_type == "group":
+            group_id = source.get("groupId", "")
+            if not group_id:
+                return user_id
+            cache_key = f"member:group:{group_id}:{user_id}"
+            url = LINE_GROUP_MEMBER_URL_FMT.format(group_id=group_id, user_id=user_id)
+        elif src_type == "room":
+            room_id = source.get("roomId", "")
+            if not room_id:
+                return user_id
+            cache_key = f"member:room:{room_id}:{user_id}"
+            url = LINE_ROOM_MEMBER_URL_FMT.format(room_id=room_id, user_id=user_id)
+        else:
+            cache_key = f"profile:{user_id}"
+            url = LINE_PROFILE_URL_FMT.format(user_id=user_id)
+        try:
+            name = await self._cached_lookup(cache_key, url, "displayName")
+        except Exception as exc:  # defensive — resolution never blocks handling
+            logger.debug("LINE: sender-name resolution failed for %s: %s", user_id, exc)
+            return user_id
+        if name:
+            return name
+        logger.debug("LINE: no display name for %s; using raw id", user_id)
+        return user_id
+
+    async def _resolve_chat_name(
+        self, source: Dict[str, Any], chat_id: str, chat_type: str
+    ) -> str:
+        """Resolve a human chat title, fail-open to ``chat_id``.
+
+        Only group chats expose a summary endpoint (``groupName``); rooms are
+        anonymous and DMs have no group title, so those keep the id.
+        """
+        if not self.sender_names or chat_type != "group":
+            return chat_id
+        group_id = (source or {}).get("groupId", "") or chat_id
+        if not group_id:
+            return chat_id
+        cache_key = f"group_summary:{group_id}"
+        url = LINE_GROUP_SUMMARY_URL_FMT.format(group_id=group_id)
+        try:
+            name = await self._cached_lookup(cache_key, url, "groupName")
+        except Exception as exc:
+            logger.debug("LINE: chat-name resolution failed for %s: %s", group_id, exc)
+            return chat_id
+        return name or chat_id
 
     async def _handle_postback_event(self, event: Dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver cached payload."""
@@ -1016,41 +1821,109 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client or not reply_token or not entry:
             return
 
-        if entry.state is State.READY:
-            payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
-            try:
-                await self._client.reply(reply_token, messages)
-                self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
-            except Exception as exc:
-                logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
-                try:
-                    await self._client.push(chat_id, messages)
-                    self._cache.mark_delivered(request_id)
-                    self._pending_buttons.pop(chat_id, None)
-                except Exception as exc2:
-                    logger.error("LINE: postback push fallback failed: %s", exc2)
-        elif entry.state is State.ERROR:
-            text = str(entry.payload or self.interrupted_text)
-            try:
-                await self._client.reply(reply_token, [_text_message(text)])
-                self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
-            except Exception as exc:
-                logger.warning("LINE: postback ERROR reply failed: %s", exc)
+        if entry.state in {State.READY, State.ERROR}:
+            await self._deliver_cached_response(request_id, chat_id, reply_token)
         elif entry.state is State.DELIVERED:
             try:
-                await self._client.reply(reply_token, [_text_message(self.delivered_text)])
+                await self._client.reply(
+                    reply_token, [_text_message(self._select_delivered_text())]
+                )
             except Exception:
                 pass
+        elif entry.state is State.DELIVERING:
+            return
         elif entry.state is State.PENDING:
-            # Still working — re-issue the wait notice.
+            # Pai's pull model (2026-07-09): every tap while the answer is
+            # not ready just replies the predefined "not done yet" text via
+            # THIS tap's own fresh reply token. No token stashing, no
+            # proactive push later -- the user taps again to check, and when
+            # the entry is READY the branch above delivers text+image in one
+            # free reply. Pinned by test_pending_tap_always_replies_not_done.
             try:
-                await self._client.reply(reply_token, [_text_message(self.pending_text)])
+                await self._client.reply(
+                    reply_token, [_text_message(self._select_pending_reply_text())]
+                )
             except Exception:
                 pass
+
+    def _register_pending_delivery_token(
+        self,
+        request_id: str,
+        chat_id: str,
+        reply_token: str,
+    ) -> bool:
+        if request_id in self._pending_delivery_tokens:
+            return False
+        self._pending_delivery_tokens[request_id] = (
+            chat_id,
+            reply_token,
+            time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
+        )
+        return True
+
+    async def _deliver_registered_pending_response(self, request_id: str) -> bool:
+        delivery = self._pending_delivery_tokens.get(request_id)
+        if not delivery:
+            return False
+        chat_id, reply_token, expires_at = delivery
+        usable_reply_token = reply_token if time.time() < expires_at else ""
+        return await self._deliver_cached_response(
+            request_id, chat_id, usable_reply_token
+        )
+
+    async def _deliver_cached_response(
+        self,
+        request_id: str,
+        chat_id: str,
+        reply_token: str,
+    ) -> bool:
+        claim = self._cache.claim_delivery(request_id)
+        if claim is None:
+            return False
+        previous_state, payload = claim
+        messages = self._messages_for_cached_payload(payload, previous_state)
+        if not messages:
+            messages = [_text_message("")]
+
+        # A reactive answer is FREE-reply-only: pushing behind the button's back
+        # defeats the button (Pai's rule, 2026-07-08). Without a live reply token
+        # we keep the answer cached (READY) so the next press delivers it free.
+        if not reply_token:
+            logger.info("LINE cached-hold (no token; awaiting next tap, never push) chat=%s n=%d", chat_id, len(messages))
+            self._cache.release_delivery_claim(request_id, previous_state)
+            return False
+        logger.info("LINE SEND site=cached kind=reply chat=%s n=%d", chat_id, len(messages))
+        try:
+            response = await self._client.reply(reply_token, messages)
+            self._remember_sent_message_texts(chat_id, response, messages)
+            self._cache.mark_delivered(request_id)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(request_id, None)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "LINE: postback reply failed (%s); keeping cached for next press (no push)",
+                exc,
+            )
+            self._cache.release_delivery_claim(request_id, previous_state)
+            return False
+
+    def _messages_for_cached_payload(
+        self,
+        payload: Any,
+        state: State,
+    ) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return _messages_from_prebuilt_payload([
+                message for message in payload[:LINE_MAX_MESSAGES_PER_CALL]
+                if isinstance(message, dict)
+            ])[:LINE_MAX_MESSAGES_PER_CALL]
+        text = (
+            str(payload or self._select_interrupted_text())
+            if state is State.ERROR
+            else str(payload or "")
+        )
+        return _messages_from_text_payload(text)
 
     async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
         if not self._client or not message_id:
@@ -1067,7 +1940,9 @@ class LineAdapter(BasePlatformAdapter):
             "file": ".bin",
         }.get(msg_type, ".bin")
         try:
-            return cache_image_from_bytes(data, ext=ext)
+            if msg_type == "image":
+                return cache_image_from_bytes(data, ext=ext)
+            return cache_media_from_bytes(data, ext=ext, media_type=msg_type)
         except Exception as exc:
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
             return None
@@ -1097,7 +1972,23 @@ class LineAdapter(BasePlatformAdapter):
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
-            return SendResult(success=True, message_id=pending_rid)
+            if await self._deliver_registered_pending_response(pending_rid):
+                return SendResult(success=True, message_id=pending_rid)
+            # The button is the delivery contract: if the answer can't go out as
+            # a FREE reply yet (no press / token expired), keep it cached behind
+            # the live button and never push. The press delivers it. (Pai, 2026-07-08)
+            entry = self._cache.get(pending_rid)
+            if entry is not None and entry.state in {State.READY, State.ERROR}:
+                return SendResult(success=True, message_id=pending_rid)
+            # Stale button (already delivered): clear so we don't swallow this
+            # fresh answer, then fall through to the normal path.
+            logger.warning(
+                "LINE: stale pending-button rid=%s for chat %s; clearing",
+                pending_rid, chat_id,
+            )
+            self._cache.mark_delivered(pending_rid)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(pending_rid, None)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
 
@@ -1111,22 +2002,24 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
-        chunks = split_for_line(strip_markdown_preserving_urls(content))
-        if not chunks:
+        messages = _messages_from_text_payload(content)
+        if not messages:
             return SendResult(success=True, message_id=None)
-        messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
         token, used_reply = self._consume_reply_token(chat_id)
+        logger.info("LINE SEND site=text kind=%s chat=%s n=%d", "reply" if (used_reply and not force_push) else "push", chat_id, len(messages))
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, messages)
+                response = await self._client.reply(token, messages)
+                self._remember_sent_message_texts(chat_id, response, messages)
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
 
         try:
-            await self._client.push(chat_id, messages)
+            response = await self._client.push(chat_id, messages)
+            self._remember_sent_message_texts(chat_id, response, messages)
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
@@ -1166,6 +2059,18 @@ class LineAdapter(BasePlatformAdapter):
         """Strip Markdown that LINE can't render. URLs are preserved."""
         return strip_markdown_preserving_urls(content)
 
+    def _select_pending_reply_text(self) -> str:
+        return _choose_text(self.pending_reply_texts, DEFAULT_PENDING_REPLY_TEXT)
+
+    def _select_pending_button_label(self) -> str:
+        return _choose_text(self.pending_button_labels, DEFAULT_BUTTON_LABEL)
+
+    def _select_delivered_text(self) -> str:
+        return _choose_text(self.delivered_texts, DEFAULT_DELIVERED_TEXT)
+
+    def _select_interrupted_text(self) -> str:
+        return _choose_text(self.interrupted_texts, DEFAULT_INTERRUPTED_TEXT)
+
     # ------------------------------------------------------------------
     # Slow-LLM postback button — driven by _keep_typing
     # ------------------------------------------------------------------
@@ -1203,7 +2108,9 @@ class LineAdapter(BasePlatformAdapter):
                 self._pending_buttons.pop(chat_id, None)
                 return
             msg = build_postback_button_message(
-                self.pending_text, self.button_label, rid
+                self._select_pending_reply_text(),
+                self._select_pending_button_label(),
+                rid,
             )
             try:
                 await self._client.reply(token, [msg])
@@ -1228,7 +2135,8 @@ class LineAdapter(BasePlatformAdapter):
         await super().interrupt_session_activity(session_key, chat_id)
         rid = self._pending_buttons.pop(chat_id, None)
         if rid:
-            self._cache.set_error(rid, self.interrupted_text)
+            self._cache.set_error(rid, self._select_interrupted_text())
+            await self._deliver_registered_pending_response(rid)
 
     # ------------------------------------------------------------------
     # Outbound media (image / voice / video)
@@ -1329,6 +2237,8 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"image file not found: {image_path}")
         if path.stat().st_size > LINE_IMAGE_MAX_BYTES:
             return SendResult(success=False, error="image exceeds 10 MB LINE limit")
+        if not self._mark_media_egress_allowed(chat_id, str(path)):
+            return SendResult(success=True)
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not self.public_base_url and self.webhook_host == "0.0.0.0":
@@ -1342,7 +2252,16 @@ class LineAdapter(BasePlatformAdapter):
         url = self._media_url(token, path.name)
         if not url.lower().startswith("https://"):
             return SendResult(success=False, error=f"LINE image URL must be HTTPS: {url}")
-        msgs: List[Dict[str, Any]] = [_image_message(url)]
+        # LINE caps previewImageUrl at 1 MB; a full multi-MB PNG reused as the
+        # preview renders BLANK on the LINE mobile app (desktop loads the
+        # original directly). Generate a small JPEG thumbnail for the preview
+        # so phones render it; fall back to the original URL if Pillow can't.
+        preview_url = url
+        _preview_path = _generate_line_preview(str(path.resolve()))
+        if _preview_path:
+            _preview_token = self._register_media(_preview_path, cleanup=True)
+            preview_url = self._media_url(_preview_token, os.path.basename(_preview_path))
+        msgs: List[Dict[str, Any]] = [_image_message(url, preview_url)]
         if caption:
             msgs.append(_text_message(caption))
         return await self._send_messages(chat_id, msgs)
@@ -1424,26 +2343,60 @@ class LineAdapter(BasePlatformAdapter):
         """Send already-built message objects, batched at 5/call."""
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+        messages = _messages_from_prebuilt_payload(messages)
         if not messages:
             return SendResult(success=True, message_id=None)
+
+        pending_rid = self._pending_buttons.get(chat_id)
+        if pending_rid:
+            self._cache.set_ready(
+                pending_rid,
+                messages[:LINE_MAX_MESSAGES_PER_CALL],
+            )
+            if await self._deliver_registered_pending_response(pending_rid):
+                return SendResult(success=True, message_id=pending_rid)
+            # Live button (answer READY, awaiting a press): keep cached, never
+            # push — the press is the delivery contract (Pai, 2026-07-08).
+            entry = self._cache.get(pending_rid)
+            if entry is not None and entry.state in {State.READY, State.ERROR}:
+                return SendResult(success=True, message_id=pending_rid)
+            # Stale button rid (no registered press, tokens expired, or the
+            # payload claim was already spent): do NOT swallow the send.
+            # Tombstone the cached payload so a very late press of the old
+            # button can't replay it, clear the stale entry, and fall through
+            # to the normal reply/push path. (2026-07-06: a leftover rid
+            # silently ate two real replies — "sent" was logged, nothing
+            # reached the chat.)
+            logger.warning(
+                "LINE: pending-button delivery unavailable for rid=%s; "
+                "clearing stale entry and sending via reply/push",
+                pending_rid,
+            )
+            self._cache.mark_delivered(pending_rid)
+            self._pending_buttons.pop(chat_id, None)
+            self._pending_delivery_tokens.pop(pending_rid, None)
 
         first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
         rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
 
         # First batch: try reply token, fall back to push.
         token, used_reply = self._consume_reply_token(chat_id)
+        logger.info("LINE SEND site=prebuilt kind=%s chat=%s n=%d", "reply" if used_reply else "push", chat_id, len(messages))
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
+                response = await self._client.reply(token, first_batch)
+                self._remember_sent_message_texts(chat_id, response, first_batch)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    response = await self._client.push(chat_id, first_batch)
+                    self._remember_sent_message_texts(chat_id, response, first_batch)
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                response = await self._client.push(chat_id, first_batch)
+                self._remember_sent_message_texts(chat_id, response, first_batch)
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
 
@@ -1452,7 +2405,8 @@ class LineAdapter(BasePlatformAdapter):
             batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
             rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
             try:
-                await self._client.push(chat_id, batch)
+                response = await self._client.push(chat_id, batch)
+                self._remember_sent_message_texts(chat_id, response, batch)
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
@@ -1559,9 +2513,9 @@ async def _standalone_send(
     if not token or not chat_id:
         return {"error": "LINE standalone send: missing token or chat_id"}
 
-    plain = strip_markdown_preserving_urls(message or "")
-    chunks = split_for_line(plain) or [""]
-    messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+    messages = _messages_from_text_payload(message or "")
+    if not messages:
+        return {"success": True, "message_id": None}
     if media_files:
         # Tack on a hint so the recipient knows media was generated but not delivered.
         messages.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
@@ -1646,7 +2600,7 @@ def register(ctx) -> None:
             "is capped at 5000 characters and at most 5 bubbles are sent per "
             "reply, so keep responses concise. Image/audio/video sending "
             "requires LINE_PUBLIC_URL configured to a publicly reachable HTTPS "
-            "host. Slow responses surface a 'Get answer' button the user taps "
+            "host. Slow responses surface a postback button the user taps "
             "to fetch the reply via a fresh free token."
         ),
     )
