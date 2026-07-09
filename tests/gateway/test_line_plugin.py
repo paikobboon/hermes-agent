@@ -410,6 +410,27 @@ class TestSendRouting:
         assert adapter._cache.get(rid).state is State.READY
         assert adapter._cache.get(rid).payload == "the answer"
 
+    def test_pending_tap_always_replies_not_done(self, adapter):
+        # Pai's pull model (2026-07-09): tapping while the answer is still
+        # PENDING must reply the predefined 'not done yet' text via the tap's
+        # own token -- NOT silently stash the token and return nothing (the
+        # old first-tap behavior that felt dead).
+        import json as _json
+        rid = adapter._cache.register_pending("Uchat")
+        event = {
+            "replyToken": "fresh-token",
+            "postback": {"data": _json.dumps({"action": "show_response", "request_id": rid})},
+            "source": {"type": "user", "userId": "Uchat"},
+        }
+        asyncio.run(adapter._handle_postback_event(event))
+        adapter._client.reply.assert_called_once()
+        token, messages = adapter._client.reply.call_args[0]
+        assert token == "fresh-token"
+        assert messages[0]["type"] == "text" and messages[0]["text"]
+        # no token stashed, no proactive delivery scheduled
+        assert rid not in adapter._pending_delivery_tokens
+        adapter._client.push.assert_not_called()
+
     def test_send_system_bypass_skips_postback_cache(self, adapter):
         # Even with a pending button, system busy-acks must surface visibly.
         rid = adapter._cache.register_pending("Uchat")
@@ -467,7 +488,12 @@ class TestSendRouting:
         assert ("list text 1", "list text 2") in choices
         assert ("list label 1", "list label 2 that is too long") in choices
 
-    def test_double_pending_postback_press_delivers_once_on_completion(self, adapter):
+    def test_pending_taps_reply_not_done_then_next_tap_delivers(self, adapter):
+        # Pai's pull model (2026-07-09): taps while PENDING each reply the
+        # predefined "not done" text (free, on that tap's own token) and never
+        # stash for proactive delivery. The completed answer caches READY (NOT
+        # auto-delivered); the NEXT tap delivers it exactly once. No push, and
+        # dedup is preserved by the cache's DELIVERING claim.
         rid = adapter._cache.register_pending("Uchat")
         adapter._pending_buttons["Uchat"] = rid
 
@@ -485,18 +511,20 @@ class TestSendRouting:
             }
 
         async def run_flow():
-            await adapter._handle_postback_event(event("tap-token-1"))
-            await adapter._handle_postback_event(event("tap-token-2"))
-            return await adapter.send("Uchat", "the answer")
+            await adapter._handle_postback_event(event("tap-1"))   # PENDING -> "not done"
+            await adapter._handle_postback_event(event("tap-2"))   # PENDING -> "not done"
+            send_result = await adapter.send("Uchat", "the answer")  # caches READY, no auto-deliver
+            await adapter._handle_postback_event(event("tap-3"))   # READY -> deliver once
+            return send_result
 
-        result = asyncio.run(run_flow())
-
-        assert result.success
+        send_result = asyncio.run(run_flow())
+        assert send_result.success
         delivered_answer_calls = [
             call for call in adapter._client.reply.call_args_list
             if call.args[1][0].get("text") == "the answer"
         ]
         assert len(delivered_answer_calls) == 1
+        assert adapter._client.reply.call_count == 3
         adapter._client.push.assert_not_called()
         assert adapter._cache.get(rid).state is State.DELIVERED
 

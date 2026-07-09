@@ -1801,9 +1801,12 @@ class LineAdapter(BasePlatformAdapter):
         elif entry.state is State.DELIVERING:
             return
         elif entry.state is State.PENDING:
-            if self._register_pending_delivery_token(request_id, chat_id, reply_token):
-                return
-            # Another tap already owns eventual delivery; keep this tap cheap.
+            # Pai's pull model (2026-07-09): every tap while the answer is
+            # not ready just replies the predefined "not done yet" text via
+            # THIS tap's own fresh reply token. No token stashing, no
+            # proactive push later -- the user taps again to check, and when
+            # the entry is READY the branch above delivers text+image in one
+            # free reply. Pinned by test_pending_tap_always_replies_not_done.
             try:
                 await self._client.reply(
                     reply_token, [_text_message(self._select_pending_reply_text())]
@@ -1850,13 +1853,14 @@ class LineAdapter(BasePlatformAdapter):
         if not messages:
             messages = [_text_message("")]
 
-        logger.info("LINE SEND site=cached kind=%s chat=%s n=%d", "reply" if reply_token else "push", chat_id, len(messages))
         # A reactive answer is FREE-reply-only: pushing behind the button's back
         # defeats the button (Pai's rule, 2026-07-08). Without a live reply token
         # we keep the answer cached (READY) so the next press delivers it free.
         if not reply_token:
+            logger.info("LINE cached-hold (no token; awaiting next tap, never push) chat=%s n=%d", chat_id, len(messages))
             self._cache.release_delivery_claim(request_id, previous_state)
             return False
+        logger.info("LINE SEND site=cached kind=reply chat=%s n=%d", chat_id, len(messages))
         try:
             response = await self._client.reply(reply_token, messages)
             self._remember_sent_message_texts(chat_id, response, messages)
