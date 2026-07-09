@@ -250,6 +250,31 @@ class TestRequestCache:
         assert c.get(rid).payload == "first"
         assert c.get(rid).state is State.DELIVERED
 
+    def test_set_ready_accumulates_multiple_payloads(self):
+        # FORK DELTA 2026-07-09: a slow turn sends its text and its image as
+        # two separate set_ready calls on the SAME pending button. Both must
+        # survive so a single postback tap delivers the whole answer -- the
+        # image must not be dropped just because the text already flipped the
+        # entry to READY. Before the fix, the second set_ready no-op'd and the
+        # picture never reached the family.
+        c = RequestCache()
+        rid = c.register_pending("Cchat")
+        c.set_ready(rid, "here is your picture")
+        image_msg = {
+            "type": "image",
+            "originalContentUrl": "https://x/i.jpg",
+            "previewImageUrl": "https://x/i.jpg",
+        }
+        c.set_ready(rid, [image_msg])
+        assert c.get(rid).state is State.READY
+        _prev, payload = c.claim_delivery(rid)
+        assert isinstance(payload, list), payload
+        types = [m.get("type") for m in payload]
+        assert "text" in types, f"text dropped: {payload}"
+        assert "image" in types, f"image dropped: {payload}"
+        text_msg = next(m for m in payload if m.get("type") == "text")
+        assert "picture" in text_msg.get("text", "")
+
     def test_find_pending_for_chat(self):
         c = RequestCache()
         rid_a = c.register_pending("Ua")

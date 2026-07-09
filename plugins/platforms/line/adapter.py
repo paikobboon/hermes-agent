@@ -370,11 +370,28 @@ class RequestCache:
 
     def set_ready(self, request_id: str, payload: Any) -> None:
         entry = self._entries.get(request_id)
-        if entry is None or entry.state is not State.PENDING:
+        if entry is None:
             return
-        entry.state = State.READY
-        entry.payload = payload
-        entry.updated_at = time.time()
+        # FORK DELTA 2026-07-09 (lucky image-drop fix): a slow turn emits its
+        # text and its image as two separate adapter sends, each calling
+        # set_ready on the same pending button id. The original guard fired
+        # only on PENDING, so the second payload (the image) hit a READY
+        # entry and was silently dropped -- a tap then delivered text only.
+        # Accumulate instead so one press delivers the whole answer.
+        # DELIVERING/DELIVERED/ERROR stay terminal (no resurrection).
+        # Pinned by test_set_ready_accumulates_multiple_payloads.
+        if entry.state is State.PENDING:
+            entry.state = State.READY
+            entry.payload = payload
+            entry.updated_at = time.time()
+            return
+        if entry.state is State.READY:
+            entry.payload = (
+                _normalize_cached_payload(entry.payload)
+                + _normalize_cached_payload(payload)
+            )[:LINE_MAX_MESSAGES_PER_CALL]
+            entry.updated_at = time.time()
+            return
 
     def set_error(self, request_id: str, message: str) -> None:
         entry = self._entries.get(request_id)
@@ -950,6 +967,20 @@ def _messages_from_prebuilt_payload(
         else:
             normalized.append(message)
     return normalized
+
+def _normalize_cached_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Coerce a cached postback payload -- plain text (str) or a prebuilt
+    message list -- into a list of LINE message dicts, so multiple slow-turn
+    sends (text + image) merge into one delivery instead of clobbering.
+    FORK DELTA 2026-07-09.
+    """
+    if isinstance(payload, list):
+        return _messages_from_prebuilt_payload(
+            [m for m in payload if isinstance(m, dict)]
+        )
+    if payload is None:
+        return []
+    return _messages_from_text_payload(str(payload))
 
 
 def _sent_message_ids(response: Any) -> List[str]:
