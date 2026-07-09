@@ -845,6 +845,52 @@ class TestStandaloneSend:
         assert not any("STICKER:" in message.get("text", "") for message in text_messages)
 
 
+class TestFlexFileMarker:
+    """FORK DELTA 2026-07-09: ``FLEXFILE:<token>`` renders a cached LINE Flex
+    message on the normal (free) reply path, modeled on the STICKER marker.
+    Generic, not Splitwise-specific."""
+
+    @staticmethod
+    def _write_flex(profile_dir, token, payload):
+        flex_dir = profile_dir / "cache" / "flex"
+        flex_dir.mkdir(parents=True, exist_ok=True)
+        (flex_dir / f"{token}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_flexfile_marker_renders_cached_flex_with_surrounding_text(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(tmp_path))
+        flex_payload = {
+            "type": "flex",
+            "altText": "Splitwise summary",
+            "contents": {
+                "type": "bubble",
+                "body": {"type": "box", "layout": "vertical", "contents": []},
+            },
+        }
+        self._write_flex(tmp_path, "tok1", flex_payload)
+
+        messages = _line._messages_from_text_payload("nice! FLEXFILE:tok1 done")
+
+        # The cached flex bubble is interleaved between the two text fragments.
+        assert [m for m in messages if m.get("type") == "flex"] == [flex_payload]
+        text_messages = [m for m in messages if m.get("type") == "text"]
+        assert [m["text"] for m in text_messages] == ["nice!", "done"]
+        assert not any("FLEXFILE:" in m.get("text", "") for m in text_messages)
+
+    def test_missing_flexfile_marker_is_left_as_literal_text(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(tmp_path))
+        with caplog.at_level("WARNING"):
+            messages = _line._messages_from_text_payload("FLEXFILE:missingtok")
+
+        # No file for the token -> the marker survives as literal text, no crash.
+        assert messages == [{"type": "text", "text": "FLEXFILE:missingtok"}]
+        assert not any(m.get("type") == "flex" for m in messages)
+        assert "FLEXFILE" in caplog.text
+
+
 class TestPostbackButtonShape:
 
     def test_template_buttons_structure(self):

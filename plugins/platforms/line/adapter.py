@@ -99,6 +99,9 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform
 from gateway import rich_sent_store
+# Active-profile-aware cache resolution — same helper base.py uses for the
+# image/audio/video caches (see IMAGE_CACHE_DIR). Used by _flex_cache_dir.
+from hermes_constants import get_hermes_dir
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +218,14 @@ _MD_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.DOTALL)
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MD_BULLET_RE = re.compile(r"^[\s]*[-*+]\s+", re.MULTILINE)
 _STICKER_MARKER_RE = re.compile(r"(?<!\S)STICKER:([^\s:]+)(?::([^\s:]+))?")
+# FORK DELTA 2026-07-09: generic FLEXFILE:<token> marker. An agent reply
+# containing ``FLEXFILE:abc123`` has that text replaced by a cached LINE Flex
+# message loaded from ``<profile>/cache/flex/<token>.json`` and sent on the
+# normal (free) reply path, exactly like STICKER. Generic, not Splitwise-
+# specific. The token charset excludes ``/`` and ``.`` so it cannot express
+# path traversal; the path is still range-checked in ``_load_flex_message``.
+_FLEXFILE_MARKER_RE = re.compile(r"(?<!\S)FLEXFILE:([A-Za-z0-9_-]{1,64})")
+_FLEX_FILE_MAX_BYTES = 60 * 1024  # 60 KB cap on a cached flex message file
 
 
 def strip_markdown_preserving_urls(text: str) -> str:
@@ -960,26 +971,118 @@ def _append_text_messages(messages: List[Dict[str, Any]], text: str) -> None:
         messages.append(_text_message(chunk))
 
 
+def _flex_cache_dir() -> Path:
+    """Resolve the active profile's Flex-message cache dir (``<profile>/cache/flex``).
+
+    Mirrors how ``gateway.platforms.base`` resolves the image/audio/video caches
+    via ``get_hermes_dir`` (active-profile-aware). Resolution order:
+    ``HERMES_PROFILE_DIR`` env override (explicit deployments / tests), then the
+    canonical ``get_hermes_dir("cache/flex", "flex_cache")``, then a lucky-profile
+    fallback. FORK DELTA 2026-07-09.
+    """
+    override = os.environ.get("HERMES_PROFILE_DIR")
+    if override:
+        return Path(override) / "cache" / "flex"
+    try:
+        return get_hermes_dir("cache/flex", "flex_cache")
+    except Exception:  # pragma: no cover - defensive fallback only
+        return Path.home() / ".hermes" / "profiles" / "lucky" / "cache" / "flex"
+
+
+def _load_flex_message(token: str) -> Optional[Dict[str, Any]]:
+    """Load + validate a cached LINE Flex message for a ``FLEXFILE:<token>`` marker.
+
+    Reads ``<flex-cache>/<token>.json``. ``token`` is already constrained to
+    ``[A-Za-z0-9_-]{1,64}`` by ``_FLEXFILE_MARKER_RE`` (no ``/``, ``.``, or
+    traversal), but we still resolve the path and confirm it stays inside the
+    flex cache dir before reading — defense in depth, mirroring the cache
+    traversal guard in ``gateway.platforms.base``. Enforces a 60 KB size cap and
+    validates the payload shape (``type == "flex"`` + dict ``contents`` + str
+    ``altText``). Returns the message dict, or ``None`` when the file is missing,
+    oversized, unreadable, malformed, or escapes the cache dir — the caller then
+    leaves the literal marker text in place. FORK DELTA 2026-07-09.
+    """
+    cache_dir = _flex_cache_dir()
+    try:
+        path = (cache_dir / f"{token}.json").resolve()
+        if not path.is_relative_to(cache_dir.resolve()):
+            logger.warning(
+                "LINE: FLEXFILE token %r escaped flex cache dir; refusing", token
+            )
+            return None
+        if not path.is_file():
+            return None
+        if path.stat().st_size > _FLEX_FILE_MAX_BYTES:
+            logger.warning(
+                "LINE: FLEXFILE %s exceeds %d-byte cap; skipping",
+                path.name,
+                _FLEX_FILE_MAX_BYTES,
+            )
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("LINE: failed to load FLEXFILE %r: %s", token, exc)
+        return None
+
+    if (
+        isinstance(data, dict)
+        and data.get("type") == "flex"
+        and isinstance(data.get("contents"), dict)
+        and isinstance(data.get("altText"), str)
+    ):
+        return data
+    logger.warning(
+        "LINE: FLEXFILE %r is not a valid flex message payload; leaving as text",
+        token,
+    )
+    return None
+
+
 def _messages_from_text_payload(content: str) -> List[Dict[str, Any]]:
-    """Build LINE messages from text plus inline ``STICKER:pkg:id`` markers."""
+    """Build LINE messages from text plus inline ``STICKER:pkg:id`` and
+    ``FLEXFILE:<token>`` markers.
+
+    Both marker families are collected and processed strictly left-to-right so a
+    single reply can interleave text, stickers, and cached Flex bubbles. An
+    invalid marker — a malformed STICKER, or a FLEXFILE that does not resolve to
+    a valid cached message — is left in place as literal text. Output is capped
+    at ``LINE_MAX_MESSAGES_PER_CALL``. FORK DELTA 2026-07-09 adds FLEXFILE.
+    """
     text = str(content or "")
     messages: List[Dict[str, Any]] = []
     last = 0
 
-    for match in _STICKER_MARKER_RE.finditer(text):
-        package_id = match.group(1) or ""
-        sticker_id = match.group(2) or ""
-        if not (package_id.isdigit() and sticker_id.isdigit()):
-            logger.warning(
-                "LINE: malformed STICKER marker %r; leaving as text",
-                match.group(0),
-            )
-            continue
+    # STICKER and FLEXFILE spans never overlap (both require a start-of-token
+    # boundary via ``(?<!\S)`` and use distinct literal prefixes), so a single
+    # position-sorted sweep interleaves them correctly with the surrounding text.
+    markers = [("sticker", m) for m in _STICKER_MARKER_RE.finditer(text)]
+    markers += [("flex", m) for m in _FLEXFILE_MARKER_RE.finditer(text)]
+    markers.sort(key=lambda item: item[1].start())
+
+    for kind, match in markers:
+        if kind == "sticker":
+            package_id = match.group(1) or ""
+            sticker_id = match.group(2) or ""
+            if not (package_id.isdigit() and sticker_id.isdigit()):
+                logger.warning(
+                    "LINE: malformed STICKER marker %r; leaving as text",
+                    match.group(0),
+                )
+                continue
+            marker_message = _sticker_message(package_id, sticker_id)
+        else:  # flex
+            marker_message = _load_flex_message(match.group(1))
+            if marker_message is None:
+                logger.warning(
+                    "LINE: unresolved FLEXFILE marker %r; leaving as text",
+                    match.group(0),
+                )
+                continue
 
         _append_text_messages(messages, text[last:match.start()])
         if len(messages) >= LINE_MAX_MESSAGES_PER_CALL:
             return messages[:LINE_MAX_MESSAGES_PER_CALL]
-        messages.append(_sticker_message(package_id, sticker_id))
+        messages.append(marker_message)
         last = match.end()
 
     _append_text_messages(messages, text[last:])
