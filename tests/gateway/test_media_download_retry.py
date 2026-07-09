@@ -1,3 +1,4 @@
+import os
 """
 Tests for media download retry logic added in PR #2982.
 
@@ -982,3 +983,27 @@ class TestMattermostSendUrlAsFile:
         # No sleep — fell back on first attempt
         mock_sleep.assert_not_called()
         assert adapter._session.get.call_count == 1
+
+
+
+class TestCacheMediaFromBytes:
+    """Non-image media (video/audio/file) must cache without the image guard.
+
+    Pins the fix for the LINE video discard bug: cache_image_from_bytes refused
+    valid MP4 payloads ("Refusing to cache non-image data"), so inbound videos
+    were fetched then thrown away. cache_media_from_bytes saves them.
+    """
+
+    def test_caches_mp4_video(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        from gateway.platforms.base import cache_media_from_bytes
+        mp4 = b"\x00\x00\x00\x1cftypmp42" + b"\x00" * 64
+        path = cache_media_from_bytes(mp4, ext=".mp4", media_type="video")
+        assert path.endswith(".mp4")
+        assert os.path.getsize(path) == len(mp4)
+
+    def test_caches_arbitrary_binary_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        from gateway.platforms.base import cache_media_from_bytes
+        path = cache_media_from_bytes(b"just some text, not an image", ext=".bin", media_type="file")
+        assert path.endswith(".bin")

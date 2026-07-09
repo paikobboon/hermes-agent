@@ -51,6 +51,16 @@ def test_whatsapp_jid_suffix_only_matches_whatsapp() -> None:
     assert _parse_target_ref("signal", "149606612619433@lid")[2] is False
 
 
+def test_line_user_id_target_is_explicit() -> None:
+    chat_id, thread_id, is_explicit = _parse_target_ref(
+        "line", "U475a429abf914ff8d21f4fd6060abd59"
+    )
+
+    assert chat_id == "U475a429abf914ff8d21f4fd6060abd59"
+    assert thread_id is None
+    assert is_explicit is True
+
+
 def test_whatsapp_friendly_name_still_uses_directory_resolution() -> None:
     assert _parse_target_ref("whatsapp", "general")[2] is False
 
@@ -89,4 +99,3 @@ def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
         media_files=[],
         force_document=False,
     )
-

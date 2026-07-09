@@ -1,10 +1,11 @@
 """Tests for the delivery routing module."""
 
 import pytest
+from urllib.parse import quote
 
 from gateway.config import GatewayConfig, Platform
 from gateway.delivery import DeliveryRouter, DeliveryTarget
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
 
 
@@ -310,6 +311,49 @@ class NonChunkingAdapter:
         return {"success": True}
 
 
+class MediaRecordingAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(None, Platform.DISCORD)
+        self.calls = []
+        self.image_batches = []
+        self.documents = []
+        self.videos = []
+        self.voices = []
+
+    async def connect(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return SendResult(success=True)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id: str):
+        return {"id": chat_id}
+
+    async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
+        self.image_batches.append(
+            {"chat_id": chat_id, "images": images, "metadata": metadata}
+        )
+
+    async def send_document(self, chat_id, file_path, metadata=None, **kwargs):
+        self.documents.append({"chat_id": chat_id, "file_path": file_path, "metadata": metadata})
+        return SendResult(success=True)
+
+    async def send_video(self, chat_id, video_path, metadata=None, **kwargs):
+        self.videos.append({"chat_id": chat_id, "video_path": video_path, "metadata": metadata})
+        return SendResult(success=True)
+
+    async def send_voice(self, chat_id, audio_path, metadata=None, **kwargs):
+        self.voices.append({"chat_id": chat_id, "audio_path": audio_path, "metadata": metadata})
+        return SendResult(success=True)
+
+
 @pytest.mark.asyncio
 async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypatch):
     """Non-chunking adapters receive truncated content with a footer + file save."""
@@ -421,3 +465,59 @@ async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tm
         await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
 
 
+@pytest.mark.asyncio
+async def test_cron_delivery_attaches_bare_image_path_and_sends_cleaned_text(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    image = tmp_path / "cron-bare.png"
+    image.write_bytes(b"png")
+    adapter = MediaRecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    await router._deliver_to_platform(
+        target,
+        f"Generated image:\n{image}\nDone.",
+        metadata={"job_id": "job-media"},
+    )
+
+    assert adapter.image_batches == [
+        {
+            "chat_id": "123",
+            "images": [(f"file://{quote(str(image))}", "")],
+            "metadata": {"job_id": "job-media"},
+        }
+    ]
+    assert adapter.calls == [
+        {"chat_id": "123", "content": "Generated image:\nDone.", "metadata": {"job_id": "job-media"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cron_delivery_attaches_markdown_image_once_and_strips_wrapper(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    image = tmp_path / "cron-markdown.png"
+    image.write_bytes(b"png")
+    adapter = MediaRecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    await router._deliver_to_platform(
+        target,
+        f"Morning caption\n![alt text]({image})\n{image}\nEnd caption",
+        metadata={"job_id": "job-markdown"},
+    )
+
+    assert adapter.image_batches == [
+        {
+            "chat_id": "123",
+            "images": [(f"file://{quote(str(image))}", "")],
+            "metadata": {"job_id": "job-markdown"},
+        }
+    ]
+    assert adapter.calls == [
+        {
+            "chat_id": "123",
+            "content": "Morning caption\nEnd caption",
+            "metadata": {"job_id": "job-markdown"},
+        }
+    ]

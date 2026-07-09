@@ -4050,7 +4050,20 @@ class BasePlatformAdapter(ABC):
         cleaned = content
         if unique:
             for raw, _exp in unique:
+                cleaned = re.sub(
+                    r'^[^\S\n]*' + re.escape(raw) + r'[^\S\n]*(?:\n|$)',
+                    '',
+                    cleaned,
+                    flags=re.MULTILINE,
+                )
                 cleaned = cleaned.replace(raw, '')
+            cleaned = re.sub(
+                r'^[^\S\n]*!\[[^\]]*\]\(\s*\)[^\S\n]*(?:\n|$)',
+                '',
+                cleaned,
+                flags=re.MULTILINE,
+            )
+            cleaned = re.sub(r'!\[[^\]]*\]\(\s*\)', '', cleaned)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         return paths, cleaned

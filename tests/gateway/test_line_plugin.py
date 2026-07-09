@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import base64
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -181,6 +182,23 @@ class TestDedup:
         d.is_duplicate("evt20")
         assert len(d._seen) <= 20  # bounded — exact cap depends on eviction policy
 
+    def test_dedup_persists_across_restarts(self, tmp_path):
+        persist = str(tmp_path / "line_dedup.json")
+        d1 = _MessageDeduplicator(persist_path=persist)
+        assert not d1.is_duplicate("evt-restart-1")
+        # A fresh instance (simulating a gateway restart) must recognize the id.
+        d2 = _MessageDeduplicator(persist_path=persist)
+        assert d2.is_duplicate("evt-restart-1")
+        # And still admit brand-new events.
+        assert not d2.is_duplicate("evt-restart-2")
+
+    def test_dedup_persist_path_unreadable_is_harmless(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        d = _MessageDeduplicator(persist_path=str(bad))
+        assert not d.is_duplicate("evt-x")
+        assert d.is_duplicate("evt-x")
+
 
 # ---------------------------------------------------------------------------
 # 5. RequestCache state machine
@@ -231,6 +249,31 @@ class TestRequestCache:
         # DELIVERED is terminal — no further mutation
         assert c.get(rid).payload == "first"
         assert c.get(rid).state is State.DELIVERED
+
+    def test_set_ready_accumulates_multiple_payloads(self):
+        # FORK DELTA 2026-07-09: a slow turn sends its text and its image as
+        # two separate set_ready calls on the SAME pending button. Both must
+        # survive so a single postback tap delivers the whole answer -- the
+        # image must not be dropped just because the text already flipped the
+        # entry to READY. Before the fix, the second set_ready no-op'd and the
+        # picture never reached the family.
+        c = RequestCache()
+        rid = c.register_pending("Cchat")
+        c.set_ready(rid, "here is your picture")
+        image_msg = {
+            "type": "image",
+            "originalContentUrl": "https://x/i.jpg",
+            "previewImageUrl": "https://x/i.jpg",
+        }
+        c.set_ready(rid, [image_msg])
+        assert c.get(rid).state is State.READY
+        _prev, payload = c.claim_delivery(rid)
+        assert isinstance(payload, list), payload
+        types = [m.get("type") for m in payload]
+        assert "text" in types, f"text dropped: {payload}"
+        assert "image" in types, f"image dropped: {payload}"
+        text_msg = next(m for m in payload if m.get("type") == "text")
+        assert "picture" in text_msg.get("text", "")
 
     def test_find_pending_for_chat(self):
         c = RequestCache()
@@ -367,6 +410,27 @@ class TestSendRouting:
         assert adapter._cache.get(rid).state is State.READY
         assert adapter._cache.get(rid).payload == "the answer"
 
+    def test_pending_tap_always_replies_not_done(self, adapter):
+        # Pai's pull model (2026-07-09): tapping while the answer is still
+        # PENDING must reply the predefined 'not done yet' text via the tap's
+        # own token -- NOT silently stash the token and return nothing (the
+        # old first-tap behavior that felt dead).
+        import json as _json
+        rid = adapter._cache.register_pending("Uchat")
+        event = {
+            "replyToken": "fresh-token",
+            "postback": {"data": _json.dumps({"action": "show_response", "request_id": rid})},
+            "source": {"type": "user", "userId": "Uchat"},
+        }
+        asyncio.run(adapter._handle_postback_event(event))
+        adapter._client.reply.assert_called_once()
+        token, messages = adapter._client.reply.call_args[0]
+        assert token == "fresh-token"
+        assert messages[0]["type"] == "text" and messages[0]["text"]
+        # no token stashed, no proactive delivery scheduled
+        assert rid not in adapter._pending_delivery_tokens
+        adapter._client.push.assert_not_called()
+
     def test_send_system_bypass_skips_postback_cache(self, adapter):
         # Even with a pending button, system busy-acks must surface visibly.
         rid = adapter._cache.register_pending("Uchat")
@@ -377,6 +441,92 @@ class TestSendRouting:
         adapter._client.push.assert_called_once()
         # And the cache entry is unchanged (still PENDING for the eventual answer)
         assert adapter._cache.get(rid).state is State.PENDING
+
+    def test_pending_button_list_config_rotates_from_plural_keys(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "pending_reply_text": "singular text",
+            "pending_reply_texts": ["list text 1", "list text 2"],
+            "pending_button_label": "singular label",
+            "pending_button_labels": ["list label 1", "list label 2 that is too long"],
+        })
+        adapter = LineAdapter(cfg)
+        adapter.slow_response_threshold = 0.01
+        adapter._client = MagicMock()
+        adapter._client.reply = AsyncMock()
+        adapter._client.loading = AsyncMock()
+        adapter._reply_tokens["Uchat"] = ("reply-token", time.time() + 30)
+
+        choices = []
+
+        def fake_choice(options):
+            choices.append(tuple(options))
+            return options[-1]
+
+        monkeypatch.setattr(_line.random, "choice", fake_choice)
+
+        async def run_keep_typing_once():
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(
+                adapter._keep_typing("Uchat", interval=0.05, stop_event=stop_event)
+            )
+            await asyncio.sleep(0.04)
+            stop_event.set()
+            await task
+
+        asyncio.run(run_keep_typing_once())
+
+        adapter._client.reply.assert_called_once()
+        sent = adapter._client.reply.call_args.args[1][0]
+        assert sent["template"]["text"] == "list text 2"
+        assert sent["template"]["actions"][0]["label"] == (
+            "list label 2 that is too long"[:20]
+        )
+        assert ("list text 1", "list text 2") in choices
+        assert ("list label 1", "list label 2 that is too long") in choices
+
+    def test_pending_taps_reply_not_done_then_next_tap_delivers(self, adapter):
+        # Pai's pull model (2026-07-09): taps while PENDING each reply the
+        # predefined "not done" text (free, on that tap's own token) and never
+        # stash for proactive delivery. The completed answer caches READY (NOT
+        # auto-delivered); the NEXT tap delivers it exactly once. No push, and
+        # dedup is preserved by the cache's DELIVERING claim.
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+
+        def event(reply_token):
+            return {
+                "type": "postback",
+                "replyToken": reply_token,
+                "source": {"type": "user", "userId": "Uchat"},
+                "postback": {
+                    "data": json.dumps({
+                        "action": "show_response",
+                        "request_id": rid,
+                    })
+                },
+            }
+
+        async def run_flow():
+            await adapter._handle_postback_event(event("tap-1"))   # PENDING -> "not done"
+            await adapter._handle_postback_event(event("tap-2"))   # PENDING -> "not done"
+            send_result = await adapter.send("Uchat", "the answer")  # caches READY, no auto-deliver
+            await adapter._handle_postback_event(event("tap-3"))   # READY -> deliver once
+            return send_result
+
+        send_result = asyncio.run(run_flow())
+        assert send_result.success
+        delivered_answer_calls = [
+            call for call in adapter._client.reply.call_args_list
+            if call.args[1][0].get("text") == "the answer"
+        ]
+        assert len(delivered_answer_calls) == 1
+        assert adapter._client.reply.call_count == 3
+        adapter._client.push.assert_not_called()
+        assert adapter._cache.get(rid).state is State.DELIVERED
 
     def test_send_caps_messages_per_call_at_five(self, adapter):
         # Build a payload that would naturally split into more than 5 LINE
@@ -397,6 +547,133 @@ class TestSendRouting:
         out = adapter.format_message("**bold** [link](https://x.com)")
         assert "**" not in out
         assert "https://x.com" in out
+
+    def test_send_sticker_marker_sends_sticker_and_remaining_text(self, adapter):
+        result = asyncio.run(adapter.send("Uchat", "Love you STICKER:446:1988"))
+
+        assert result.success
+        adapter._client.push.assert_called_once()
+        sent_messages = adapter._client.push.call_args.args[1]
+        assert sent_messages == [
+            {"type": "text", "text": "Love you"},
+            {"type": "sticker", "packageId": "446", "stickerId": "1988"},
+        ]
+
+    def test_prebuilt_text_reply_path_parses_sticker_marker(self, adapter):
+        adapter._reply_tokens["Uchat"] = ("rt-token", time.time() + 30)
+
+        result = asyncio.run(
+            adapter._send_messages(
+                "Uchat",
+                [{"type": "text", "text": "Love you STICKER:446:1988"}],
+            )
+        )
+
+        assert result.success
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
+        assert adapter._client.reply.call_args.args[1] == [
+            {"type": "text", "text": "Love you"},
+            {"type": "sticker", "packageId": "446", "stickerId": "1988"},
+        ]
+
+    def test_malformed_sticker_marker_is_left_as_text(self, adapter, caplog):
+        with caplog.at_level("WARNING"):
+            result = asyncio.run(adapter.send("Uchat", "Love you STICKER:abc"))
+
+        assert result.success
+        adapter._client.push.assert_called_once()
+        sent_messages = adapter._client.push.call_args.args[1]
+        assert sent_messages == [
+            {"type": "text", "text": "Love you STICKER:abc"},
+        ]
+        assert "malformed STICKER marker" in caplog.text
+
+
+class TestQuoteContext:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+        })
+        ad = LineAdapter(cfg)
+        ad.sender_names = False
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        ad._client.loading = AsyncMock()
+        ad.handle_message = AsyncMock()
+        return ad
+
+    def _event(self, message_id="msg-new", quoted_message_id=None):
+        message = {
+            "type": "text",
+            "id": message_id,
+            "text": "What did you mean?",
+        }
+        if quoted_message_id:
+            message["quotedMessageId"] = quoted_message_id
+        return {
+            "type": "message",
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "Uchat"},
+            "message": message,
+        }
+
+    def test_quoted_message_id_resolves_from_rich_sent_store(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "lookup",
+            lambda chat_id, message_id: (
+                "Dinner is at 6" if (chat_id, message_id) == ("Uchat", "quoted-1") else None
+            ),
+        )
+
+        asyncio.run(adapter._handle_message_event(self._event(quoted_message_id="quoted-1")))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id == "quoted-1"
+        assert captured.reply_to_text == "Dinner is at 6"
+
+    def test_unresolvable_quoted_message_id_uses_placeholder(self, adapter, monkeypatch):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)
+
+        asyncio.run(adapter._handle_message_event(self._event(quoted_message_id="missing-1")))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id == "missing-1"
+        assert captured.reply_to_text == "[quoted an earlier message]"
+
+    def test_quoted_outbound_line_message_id_resolves_from_recent_cache(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)
+        adapter._client.push.return_value = {"sentMessages": [{"id": "sent-1"}]}
+
+        result = asyncio.run(adapter.send("Uchat", "Dinner is at 6"))
+        assert result.success
+
+        asyncio.run(adapter._handle_message_event(self._event(quoted_message_id="sent-1")))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id == "sent-1"
+        assert captured.reply_to_text == "Dinner is at 6"
+
+    def test_absent_quoted_message_id_leaves_reply_context_empty(self, adapter, monkeypatch):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda chat_id, message_id: None)
+
+        asyncio.run(adapter._handle_message_event(self._event()))
+
+        captured = adapter.handle_message.call_args.args[0]
+        assert captured.reply_to_message_id is None
+        assert captured.reply_to_text is None
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +809,41 @@ class TestStandaloneSend:
         # Message wraps as text bubble
         assert push_calls[0][1][0]["type"] == "text"
 
+    def test_standalone_send_parses_sticker_markers(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        push_calls = []
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def push(self, chat_id, messages):
+                push_calls.append((chat_id, messages))
+
+        monkeypatch.setattr(_line, "_LineClient", _FakeClient)
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"channel_access_token": "tok"},
+        )
+        result = asyncio.run(
+            _standalone_send(cfg, "Uchat", "ขอบคุณค่ะ 💙\nSTICKER:789:10863")
+        )
+
+        assert result.get("success") is True
+        assert len(push_calls) == 1
+        messages = push_calls[0][1]
+        sticker_messages = [
+            message for message in messages if message.get("type") == "sticker"
+        ]
+        assert sticker_messages == [
+            {"type": "sticker", "packageId": "789", "stickerId": "10863"},
+        ]
+        text_messages = [message for message in messages if message.get("type") == "text"]
+        assert len(text_messages) == 1
+        assert any("ขอบคุณค่ะ" in message.get("text", "") for message in text_messages)
+        assert not any("STICKER:" in message.get("text", "") for message in text_messages)
+
 
 class TestPostbackButtonShape:
 
@@ -633,6 +945,25 @@ class TestAdapterInit:
         assert ad.allowed_users == {"U1", "U2", "U3"}
         assert ad.allowed_groups == {"C1"}
 
+    def test_singular_slow_response_copy_keys_accept_lists(self, monkeypatch):
+        monkeypatch.delenv("LINE_PENDING_REPLY_TEXT", raising=False)
+        monkeypatch.delenv("LINE_PENDING_BUTTON_LABEL", raising=False)
+        monkeypatch.delenv("LINE_DELIVERED_TEXT", raising=False)
+        monkeypatch.delenv("LINE_INTERRUPTED_TEXT", raising=False)
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "t",
+            "channel_secret": "s",
+            "pending_reply_text": ["wait 1", "wait 2"],
+            "pending_button_label": ["get 1", "get 2"],
+            "delivered_text": ["done 1", "done 2"],
+            "interrupted_text": ["stop 1", "stop 2"],
+        }))
+        assert ad.pending_reply_texts == ["wait 1", "wait 2"]
+        assert ad.pending_button_labels == ["get 1", "get 2"]
+        assert ad.delivered_texts == ["done 1", "done 2"]
+        assert ad.interrupted_texts == ["stop 1", "stop 2"]
+
     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
@@ -674,3 +1005,63 @@ class TestMessageTypeMapping:
     def test_unknown_type_falls_back_to_text(self):
         MessageType = _line.MessageType
         assert _line._LINE_MESSAGE_TYPES.get("flex", MessageType.TEXT) == MessageType.TEXT
+
+
+
+class TestNeverPushBehindButton:
+    """Reactive answers behind a slow-LLM button are delivered ONLY by a press
+    (free reply). They are never pushed behind the button's back. (Pai, 2026-07-08)."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={"channel_access_token": "tok", "channel_secret": "sec"})
+        ad = LineAdapter(cfg)
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        return ad
+
+    def test_expired_delivery_token_never_pushes(self, adapter):
+        import time as _time
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        # User pressed earlier, but that reply token has since expired.
+        adapter._pending_delivery_tokens[rid] = ("Uchat", "old-token", _time.time() - 1)
+        result = asyncio.run(adapter.send("Uchat", "the answer"))
+        assert result.success
+        adapter._client.push.assert_not_called()   # never push behind the button
+        adapter._client.reply.assert_not_called()  # expired token can't reply
+        assert adapter._cache.get(rid).state is State.READY  # waits for the next press
+        assert adapter._cache.get(rid).payload == "the answer"
+
+    def test_press_with_valid_token_replies_free(self, adapter):
+        import time as _time
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        adapter._cache.set_ready(rid, "the answer")
+        adapter._pending_delivery_tokens[rid] = ("Uchat", "fresh-token", _time.time() + 30)
+        ok = asyncio.run(adapter._deliver_registered_pending_response(rid))
+        assert ok
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
+
+
+class TestLinePreview:
+    def test_preview_is_small_jpeg_distinct_from_source(self, tmp_path):
+        import pytest, os as _os
+        Image = pytest.importorskip("PIL.Image")
+        # A full multi-MB PNG reused as LINE's previewImageUrl (>1 MB) renders
+        # blank on the mobile app. _generate_line_preview must return a small
+        # (<=1 MB) JPEG thumbnail, distinct from the source.
+        src = tmp_path / "big.png"
+        Image.frombytes("RGB", (1254, 1254), _os.urandom(1254 * 1254 * 3)).save(src, "PNG")
+        assert src.stat().st_size > 1_048_576, "source PNG should exceed 1 MB"
+        preview = _line._generate_line_preview(str(src))
+        assert preview is not None and preview != str(src)
+        assert _os.path.getsize(preview) <= 1_000_000, "preview must be <= 1 MB"
+        with open(preview, "rb") as fh:
+            assert fh.read(3) == b"\xff\xd8\xff", "preview must be JPEG"
+        _os.unlink(preview)
