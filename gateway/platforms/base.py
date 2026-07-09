@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -34,6 +34,12 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# 8s: sub-turn window only. The duplicate-delivery class is same-turn multi-lane
+# emission; a cross-turn window risks silently suppressing a legitimate resend
+# (Cato audit W1, 2026-07-07 — in a health context a silent drop of an updated
+# image is worse than a duplicate).
+_MEDIA_EGRESS_GUARD_TTL_SECONDS = 8.0
+_MEDIA_EGRESS_GUARD_MAX_ENTRIES = 256
 
 
 def _platform_name(platform) -> str:
@@ -717,6 +723,31 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
         )
     cache_dir = get_image_cache_dir()
     filename = f"img_{uuid.uuid4().hex[:12]}{ext}"
+    filepath = cache_dir / filename
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
+def cache_media_from_bytes(data: bytes, ext: str = ".bin", *, media_type: str = "file") -> str:
+    """
+    Save raw non-image media bytes (video/audio/file) to the cache and return
+    the absolute file path.
+
+    Unlike :func:`cache_image_from_bytes`, this does NOT require the payload to
+    look like an image -- LINE videos, audio clips, and document attachments are
+    legitimately non-image binaries. Inbound size is still validated.
+
+    Args:
+        data: Raw media bytes.
+        ext:  File extension including the dot (e.g. ".mp4", ".m4a", ".bin").
+        media_type: Label used in size-limit error messages.
+
+    Returns:
+        Absolute path to the cached media file as a string.
+    """
+    validate_inbound_media_size(len(data), media_type=media_type)
+    cache_dir = get_image_cache_dir()
+    filename = f"media_{uuid.uuid4().hex[:12]}{ext}"
     filepath = cache_dir / filename
     filepath.write_bytes(data)
     return str(filepath)
@@ -2398,6 +2429,10 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Per-adapter delivery boundary guard. Keyed by (chat_id, normalized
+        # media identity) so cross-lane or future send paths cannot emit the
+        # same image twice into one chat during a single turn-sized window.
+        self._media_egress_guard: dict[tuple[str, str], float] = {}
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -3251,6 +3286,8 @@ class BasePlatformAdapter(ABC):
         instead of plain-text URLs. Default falls back to sending the
         URL as a text message.
         """
+        if not self._mark_media_egress_allowed(chat_id, image_url):
+            return SendResult(success=True)
         # Fallback: send URL as text (subclasses override for native images)
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -3455,6 +3492,8 @@ class BasePlatformAdapter(ABC):
         chat, since it is a host filesystem path that would leak the
         Hermes home layout.
         """
+        if not self._mark_media_egress_allowed(chat_id, image_path):
+            return SendResult(success=True)
         # See send_voice for the rationale: do not echo host paths into chat.
         logger.warning(
             "[%s] send_image_file fallback: native image send unavailable for %s",
@@ -3464,6 +3503,182 @@ class BasePlatformAdapter(ABC):
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
+    async def assemble_and_send_media(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> str:
+        """Deliver native media attachments from ``content`` and return cleaned text.
+
+        This is the shared outbound assembly used by both interactive gateway
+        replies and cron/scheduled delivery: explicit ``MEDIA:`` tags are
+        extracted first, markdown/HTML image tags second, and bare local paths
+        last so each extractor sees the previous extractor's cleaned text.
+        """
+        force_document_attachments = "[[as_document]]" in content
+
+        media_files, cleaned = self.extract_media(content)
+        media_files = self.filter_media_delivery_paths(media_files)
+
+        images, cleaned = self.extract_images(cleaned)
+        cleaned = _strip_media_directives(cleaned).strip()
+
+        local_files, cleaned = self.extract_local_files(cleaned)
+        local_files = self.filter_local_delivery_paths(local_files)
+
+        media_files, local_files = self.dedupe_delivery_paths(media_files, local_files)
+
+        _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+        _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+        image_paths: list[str] = []
+        non_image_media: list[tuple[str, bool]] = []
+        for media_path, is_voice in media_files:
+            ext = Path(media_path).suffix.lower()
+            if ext in _IMAGE_EXTS and not is_voice and not force_document_attachments:
+                image_paths.append(media_path)
+            else:
+                non_image_media.append((media_path, is_voice))
+
+        non_image_local: list[str] = []
+        for file_path in local_files:
+            if Path(file_path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments:
+                image_paths.append(file_path)
+            else:
+                non_image_local.append(file_path)
+
+        (image_paths,) = self.dedupe_delivery_paths(image_paths)
+
+        if images or image_paths:
+            batch = list(images)
+            batch.extend((f"file://{quote(path)}", "") for path in image_paths)
+            try:
+                await self.send_multiple_images(
+                    chat_id=chat_id,
+                    images=batch,
+                    metadata=metadata,
+                    human_delay=human_delay,
+                )
+            except Exception as batch_err:
+                logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+
+        for media_path, is_voice in non_image_media:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                ext = Path(media_path).suffix.lower()
+                if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                    result = await self.send_voice(
+                        chat_id=chat_id,
+                        audio_path=media_path,
+                        metadata=metadata,
+                    )
+                elif ext in _VIDEO_EXTS:
+                    result = await self.send_video(
+                        chat_id=chat_id,
+                        video_path=media_path,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await self.send_document(
+                        chat_id=chat_id,
+                        file_path=media_path,
+                        metadata=metadata,
+                    )
+                if not getattr(result, "success", True):
+                    logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, getattr(result, "error", None))
+            except Exception as media_err:
+                logger.warning("[%s] Error sending media: %s", self.name, media_err)
+
+        for file_path in non_image_local:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                ext = Path(file_path).suffix.lower()
+                if ext in _VIDEO_EXTS:
+                    await self.send_video(
+                        chat_id=chat_id,
+                        video_path=file_path,
+                        metadata=metadata,
+                    )
+                else:
+                    await self.send_document(
+                        chat_id=chat_id,
+                        file_path=file_path,
+                        metadata=metadata,
+                    )
+            except Exception as file_err:
+                logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+        return cleaned
+
+    @staticmethod
+    def media_egress_identity(media_reference: str) -> str:
+        """Return the duplicate-suppression identity for outbound media.
+
+        Local files use the same normalization as ``dedupe_delivery_paths``:
+        strip ``file://``, URL-decode, expand ``~``, then ``realpath``. HTTP(S)
+        URLs intentionally use the exact URL string because distinct signed URL
+        query strings can identify distinct resources. On macOS case-insensitive
+        volumes, ``realpath`` resolves symlinks but does not canonicalize path
+        spelling case, so differently-cased names for the same file may remain
+        distinct; this preserves the helper's existing realpath-based contract
+        and avoids collapsing genuinely different paths on case-sensitive
+        filesystems.
+        """
+        value = str(media_reference or "")
+        scheme = urlsplit(value).scheme.lower()
+        if scheme in {"http", "https"}:
+            return value
+        if value.lower().startswith("file://"):
+            value = value[7:]
+        resolved = os.path.realpath(os.path.expanduser(unquote(value)))
+        # Content-aware: a regenerated file at the same path (new mtime/size)
+        # is a NEW identity — the guard must never suppress updated content
+        # (Cato audit W1, 2026-07-07).
+        try:
+            st = os.stat(resolved)
+            return f"{resolved}|{st.st_mtime_ns}|{st.st_size}"
+        except OSError:
+            return resolved
+
+    def _mark_media_egress_allowed(self, chat_id: str, media_reference: str) -> bool:
+        """Return False when this chat recently saw the same media identity."""
+        guard = getattr(self, "_media_egress_guard", None)
+        if guard is None:
+            guard = {}
+            self._media_egress_guard = guard
+
+        now = time.monotonic()
+        expired = [
+            key for key, sent_at in guard.items()
+            if now - sent_at >= _MEDIA_EGRESS_GUARD_TTL_SECONDS
+        ]
+        for key in expired:
+            guard.pop(key, None)
+
+        identity = self.media_egress_identity(media_reference)
+        key = (str(chat_id), identity)
+        sent_at = guard.get(key)
+        if sent_at is not None:
+            age = now - sent_at
+            if age < _MEDIA_EGRESS_GUARD_TTL_SECONDS:
+                logger.warning(
+                    "media egress guard: suppressed duplicate %s to %s (sent %.1fs ago)",
+                    safe_url_for_log(identity),
+                    chat_id,
+                    age,
+                )
+                return False
+
+        guard[key] = now
+        while len(guard) > _MEDIA_EGRESS_GUARD_MAX_ENTRIES:
+            oldest_key = min(guard, key=guard.get)
+            guard.pop(oldest_key, None)
+        return True
 
     @staticmethod
     def validate_media_delivery_path(path: str) -> Optional[str]:
@@ -3495,6 +3710,67 @@ class BasePlatformAdapter(ABC):
             else:
                 logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
         return safe_paths
+
+    @staticmethod
+    def dedupe_delivery_paths(*path_groups):
+        """
+        Remove duplicate attachment paths across extractor lanes.
+
+        Hermes' outbound assembly gathers deliverables from multiple extractors:
+        explicit ``MEDIA:`` tags, image/link extraction, and bare local path
+        detection. Each extractor dedupes only within its own result set, so the
+        same file can otherwise be delivered twice when it appears in two forms
+        such as ``MEDIA:/tmp/a.png`` plus ``/tmp/a.png``, or
+        ``file:///tmp/a.png`` plus the absolute path.
+
+        This fork-maintained helper (2026-07-07) is intentionally additive and
+        dependency-free so downstream fork delivery paths can share one stable
+        cross-lane identity rule without changing extractor behavior.
+
+        Args:
+            *path_groups: Any number of iterables. Items may be bare path strings
+                or tuple-shaped media entries whose first element is the path
+                and remaining values are preserved (for example ``(path,
+                is_voice)``).
+
+        Returns:
+            A tuple containing one list per input group. Item shapes and original
+            item values are preserved, first occurrence wins in argument order,
+            and order is preserved within each group.
+
+        Identity:
+            ``file://`` prefixes are stripped, the remaining path is URL-decoded,
+            ``~`` is expanded, and ``os.path.realpath`` resolves the final key.
+            On macOS case-insensitive volumes, ``realpath`` does not normalize
+            spelling case; that nuance is intentional here so the helper stays
+            realpath-based rather than doing broader, platform-specific path
+            folding.
+        """
+        seen: set[str] = set()
+        deduped_groups: list[list] = []
+        before_count = 0
+        after_count = 0
+
+        for group in path_groups:
+            deduped: list = []
+            for item in group or []:
+                before_count += 1
+                raw_path = item[0] if isinstance(item, tuple) else item
+                path = str(raw_path)
+                if path.lower().startswith("file://"):
+                    path = path[7:]
+                identity = os.path.realpath(os.path.expanduser(unquote(path)))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                deduped.append(item)
+                after_count += 1
+            deduped_groups.append(deduped)
+
+        if after_count < before_count:
+            logger.info("cross-lane dedupe: %d -> %d", before_count, after_count)
+
+        return tuple(deduped_groups)
 
 
     @staticmethod
