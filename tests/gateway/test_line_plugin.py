@@ -664,6 +664,18 @@ class TestSendDocument:
         assert "internal-123.tmp" not in blob
 
 
+
+    def test_send_document_non_pdf_has_no_hero(self, adapter, tmp_path):
+        doc = tmp_path / "notes.txt"
+        doc.write_bytes(b"hello")
+
+        result = asyncio.run(adapter.send_document("Uchat", str(doc)))
+
+        assert result.success
+        sent = adapter._client.push.call_args.args[1]
+        assert "hero" not in sent[0]["contents"]
+
+
 class TestQuoteContext:
 
     @pytest.fixture

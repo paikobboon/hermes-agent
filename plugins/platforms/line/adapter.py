@@ -918,19 +918,79 @@ def _human_file_size(num_bytes: int) -> str:
     return f"{num_bytes} bytes"
 
 
-def _document_flex_message(name: str, size_label: str, url: str) -> Dict[str, Any]:
+_PDF_PREVIEW_PY_CANDIDATES = (
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+)
+
+
+def _generate_pdf_page_preview(src_path: str) -> Optional[str]:
+    """Best-effort: render page 1 of a PDF to a small JPEG for the flex hero.
+
+    The gateway venv has no PyMuPDF, so rendering shells out to a system
+    python3 that does (Lucky's terminal interpreter). Any failure -> None,
+    the file card simply ships without a hero image.
+    """
+    import subprocess
+
+    out_png = None
+    try:
+        fd, out_png = tempfile.mkstemp(suffix=".png", prefix="line_pdfhero_")
+        os.close(fd)
+        script = (
+            "import sys, fitz; d = fitz.open(sys.argv[1]); "
+            "p = d[0]; pix = p.get_pixmap(matrix=fitz.Matrix(2, 2)); "
+            "pix.save(sys.argv[2])"
+        )
+        for py in _PDF_PREVIEW_PY_CANDIDATES:
+            if not os.path.exists(py):
+                continue
+            proc = subprocess.run(
+                [py, "-c", script, src_path, out_png],
+                capture_output=True, timeout=15,
+            )
+            if proc.returncode == 0 and os.path.getsize(out_png) > 0:
+                jpeg = _generate_line_preview(out_png)
+                return jpeg
+        return None
+    except Exception:
+        logger.debug("LINE: pdf page preview failed for %s", src_path, exc_info=True)
+        return None
+    finally:
+        if out_png:
+            try:
+                os.unlink(out_png)
+            except OSError:
+                pass
+
+
+def _document_flex_message(
+    name: str, size_label: str, url: str, hero_url: Optional[str] = None
+) -> Dict[str, Any]:
     """A file-attachment-style Flex card: filename, size, tap-to-open button.
 
     LINE's bot API has no file message type, so this is the closest
     native-feeling delivery for documents (the button opens the HTTPS
     download link served by the adapter's media server).
     """
+    bubble: Dict[str, Any] = {
+        "type": "bubble",
+        "size": "kilo",
+    }
+    if hero_url:
+        bubble["hero"] = {
+            "type": "image",
+            "url": hero_url,
+            "size": "full",
+            "aspectRatio": "4:3",
+            "aspectMode": "cover",
+            "action": {"type": "uri", "uri": url},
+        }
     return {
         "type": "flex",
-        "altText": f"\U0001F4C4 {name}",
-        "contents": {
-            "type": "bubble",
-            "size": "kilo",
+        "altText": f"📄 {name}",
+        "contents": bubble | {
             "body": {
                 "type": "box",
                 "layout": "vertical",
@@ -2483,8 +2543,18 @@ class LineAdapter(BasePlatformAdapter):
             chat_id, display, size, url,
         )
 
+        hero_url: Optional[str] = None
+        if path.suffix.lower() == ".pdf":
+            preview_path = _generate_pdf_page_preview(str(path.resolve()))
+            if preview_path:
+                ptoken = self._register_media(
+                    preview_path, cleanup=True, ttl=DOCUMENT_TOKEN_TTL_SECONDS
+                )
+                hero_url = self._media_url(ptoken, os.path.basename(preview_path))
+                if not hero_url.lower().startswith("https://"):
+                    hero_url = None
         msgs: List[Dict[str, Any]] = [
-            _document_flex_message(display, _human_file_size(size), url)
+            _document_flex_message(display, _human_file_size(size), url, hero_url)
         ]
         if caption:
             msgs.append(_text_message(caption))
