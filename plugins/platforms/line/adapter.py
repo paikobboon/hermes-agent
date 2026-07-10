@@ -2425,6 +2425,11 @@ class LineAdapter(BasePlatformAdapter):
         if not url.lower().startswith("https://"):
             return SendResult(success=False, error=f"LINE file URL must be HTTPS: {url}")
 
+        logger.info(
+            "LINE SEND site=document chat=%s name=%s size=%d url=%s",
+            chat_id, display, size, url,
+        )
+
         lines: List[str] = []
         if caption:
             lines.append(caption)
