@@ -918,6 +918,59 @@ def _human_file_size(num_bytes: int) -> str:
     return f"{num_bytes} bytes"
 
 
+def _document_flex_message(name: str, size_label: str, url: str) -> Dict[str, Any]:
+    """A file-attachment-style Flex card: filename, size, tap-to-open button.
+
+    LINE's bot API has no file message type, so this is the closest
+    native-feeling delivery for documents (the button opens the HTTPS
+    download link served by the adapter's media server).
+    """
+    return {
+        "type": "flex",
+        "altText": f"\U0001F4C4 {name}",
+        "contents": {
+            "type": "bubble",
+            "size": "kilo",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": f"\U0001F4C4 {name}",
+                        "weight": "bold",
+                        "size": "sm",
+                        "wrap": True,
+                    },
+                    {
+                        "type": "text",
+                        "text": f"{size_label} \u00b7 \u0e25\u0e34\u0e07\u0e01\u0e4c\u0e43\u0e0a\u0e49\u0e44\u0e14\u0e49 24 \u0e0a\u0e21.",
+                        "size": "xs",
+                        "color": "#999999",
+                    },
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "height": "sm",
+                        "action": {
+                            "type": "uri",
+                            "label": "\u0e40\u0e1b\u0e34\u0e14\u0e44\u0e1f\u0e25\u0e4c",
+                            "uri": url,
+                        },
+                    },
+                ],
+            },
+        },
+    }
+
+
 def _generate_line_preview(
     src_path: str, *, max_dim: int = 1024, max_bytes: int = 1_000_000
 ) -> Optional[str]:
@@ -2430,15 +2483,12 @@ class LineAdapter(BasePlatformAdapter):
             chat_id, display, size, url,
         )
 
-        lines: List[str] = []
+        msgs: List[Dict[str, Any]] = [
+            _document_flex_message(display, _human_file_size(size), url)
+        ]
         if caption:
-            lines.append(caption)
-        lines.extend([
-            f"📄 {display} ({_human_file_size(size)})",
-            url,
-            "link valid 24h",
-        ])
-        return await self._send_text_chunks(chat_id, "\n".join(lines), force_push=False)
+            msgs.append(_text_message(caption))
+        return await self._send_messages(chat_id, msgs)
 
     async def send_voice(
         self,

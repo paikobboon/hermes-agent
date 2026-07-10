@@ -618,10 +618,11 @@ class TestSendDocument:
         adapter._client.push.assert_called_once()
         sent = adapter._client.push.call_args.args[1]
         assert len(sent) == 1
-        text = sent[0]["text"]
-        assert "report.pdf" in text
-        assert "https://line-public.example.com/line/media/" in text
-        assert str(tmp_path) not in text
+        assert sent[0]["type"] == "flex"
+        blob = json.dumps(sent[0])
+        assert "report.pdf" in blob
+        assert "https://line-public.example.com/line/media/" in blob
+        assert str(tmp_path) not in blob
 
     def test_send_document_missing_file_fails(self, adapter, tmp_path):
         missing = tmp_path / "missing.pdf"
@@ -655,12 +656,12 @@ class TestSendDocument:
 
         assert result.success
         sent = adapter._client.push.call_args.args[1]
-        text = sent[0]["text"]
-        assert "Salary_Guide.pdf" in text
-        url_lines = [line for line in text.splitlines() if line.startswith("https://")]
-        assert len(url_lines) == 1
-        assert "Salary_Guide.pdf" in url_lines[0]
-        assert "internal-123.tmp" not in text
+        assert sent[0]["type"] == "flex"
+        blob = json.dumps(sent[0])
+        assert "Salary_Guide.pdf" in blob
+        uri = sent[0]["contents"]["footer"]["contents"][0]["action"]["uri"]
+        assert "Salary_Guide.pdf" in uri
+        assert "internal-123.tmp" not in blob
 
 
 class TestQuoteContext:
