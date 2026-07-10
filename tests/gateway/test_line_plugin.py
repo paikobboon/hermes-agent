@@ -590,6 +590,79 @@ class TestSendRouting:
         assert "malformed STICKER marker" in caplog.text
 
 
+class TestSendDocument:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "public_url": "https://line-public.example.com",
+        })
+        ad = LineAdapter(cfg)
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        return ad
+
+    def test_send_document_pushes_download_link(self, adapter, tmp_path):
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4\nfake pdf\n")
+
+        result = asyncio.run(adapter.send_document("Uchat", str(doc)))
+
+        assert result.success
+        adapter._client.push.assert_called_once()
+        sent = adapter._client.push.call_args.args[1]
+        assert len(sent) == 1
+        text = sent[0]["text"]
+        assert "report.pdf" in text
+        assert "https://line-public.example.com/line/media/" in text
+        assert str(tmp_path) not in text
+
+    def test_send_document_missing_file_fails(self, adapter, tmp_path):
+        missing = tmp_path / "missing.pdf"
+
+        result = asyncio.run(adapter.send_document("Uchat", str(missing)))
+
+        assert not result.success
+        assert f"document not found: {missing}" == result.error
+        adapter._client.push.assert_not_called()
+        adapter._client.reply.assert_not_called()
+
+    def test_send_document_registers_long_ttl(self, adapter, tmp_path):
+        doc = tmp_path / "late-tap.pdf"
+        doc.write_bytes(b"%PDF-1.4\n")
+        before = time.time()
+
+        result = asyncio.run(adapter.send_document("Uchat", str(doc)))
+
+        assert result.success
+        assert len(adapter._media_tokens) == 1
+        _, expires_at = next(iter(adapter._media_tokens.values()))
+        assert expires_at >= before + 23 * 3600
+
+    def test_send_document_respects_file_name_override(self, adapter, tmp_path):
+        doc = tmp_path / "internal-123.tmp"
+        doc.write_bytes(b"%PDF-1.4\n")
+
+        result = asyncio.run(
+            adapter.send_document("Uchat", str(doc), file_name="Salary_Guide.pdf")
+        )
+
+        assert result.success
+        sent = adapter._client.push.call_args.args[1]
+        text = sent[0]["text"]
+        assert "Salary_Guide.pdf" in text
+        url_lines = [line for line in text.splitlines() if line.startswith("https://")]
+        assert len(url_lines) == 1
+        assert "Salary_Guide.pdf" in url_lines[0]
+        assert "internal-123.tmp" not in text
+
+
 class TestQuoteContext:
 
     @pytest.fixture

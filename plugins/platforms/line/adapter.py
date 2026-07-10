@@ -161,8 +161,10 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 
 # Media defaults
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
+DOCUMENT_TOKEN_TTL_SECONDS = 24 * 3600  # humans tap file links later than LINE fetches images
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+LINE_DOCUMENT_MAX_BYTES = 200 * 1024 * 1024  # match LINE_AV_MAX_BYTES scale
 
 # Sender/chat identity resolution
 SENDER_NAME_CACHE_TTL_SECONDS = 6 * 3600  # 6h; display names rarely change
@@ -903,6 +905,17 @@ def _image_message(original_url: str, preview_url: Optional[str] = None) -> Dict
         "originalContentUrl": original_url,
         "previewImageUrl": preview_url or original_url,
     }
+
+
+def _human_file_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "bytes":
+                return f"{int(value)} bytes"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{num_bytes} bytes"
 
 
 def _generate_line_preview(
@@ -2245,7 +2258,13 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound media (image / voice / video)
     # ------------------------------------------------------------------
 
-    def _register_media(self, file_path: str, *, cleanup: bool = False) -> str:
+    def _register_media(
+        self,
+        file_path: str,
+        *,
+        cleanup: bool = False,
+        ttl: Optional[float] = None,
+    ) -> str:
         """Register a local file for HTTPS serving; return the URL token."""
         # Evict expired tokens first.
         now = time.time()
@@ -2262,7 +2281,8 @@ class LineAdapter(BasePlatformAdapter):
 
         resolved = str(Path(file_path).resolve())
         token = secrets.token_urlsafe(32)
-        self._media_tokens[token] = (resolved, now + self._media_ttl)
+        expires_in = self._media_ttl if ttl is None else ttl
+        self._media_tokens[token] = (resolved, now + expires_in)
         if cleanup:
             self._media_temp_paths.add(resolved)
         return token
@@ -2368,6 +2388,52 @@ class LineAdapter(BasePlatformAdapter):
         if caption:
             msgs.append(_text_message(caption))
         return await self._send_messages(chat_id, msgs)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return SendResult(success=False, error=f"document not found: {file_path}")
+        size = path.stat().st_size
+        if size > LINE_DOCUMENT_MAX_BYTES:
+            return SendResult(success=False, error="document exceeds 200 MB LINE limit")
+        if not self._mark_media_egress_allowed(chat_id, str(path)):
+            return SendResult(success=True)
+        if not self._client:
+            return SendResult(success=False, error="LINE adapter not connected")
+        if not self.public_base_url and self.webhook_host == "0.0.0.0":
+            return SendResult(
+                success=False,
+                error="LINE_PUBLIC_URL must be set to send files "
+                "(LINE only accepts publicly reachable HTTPS URLs)",
+            )
+
+        display = file_name or path.name
+        token = self._register_media(
+            str(path.resolve()),
+            ttl=DOCUMENT_TOKEN_TTL_SECONDS,
+        )
+        url = self._media_url(token, display)
+        if not url.lower().startswith("https://"):
+            return SendResult(success=False, error=f"LINE file URL must be HTTPS: {url}")
+
+        lines: List[str] = []
+        if caption:
+            lines.append(caption)
+        lines.extend([
+            f"📄 {display} ({_human_file_size(size)})",
+            url,
+            "link valid 24h",
+        ])
+        return await self._send_text_chunks(chat_id, "\n".join(lines), force_push=False)
 
     async def send_voice(
         self,
@@ -2703,7 +2769,10 @@ def register(ctx) -> None:
             "is capped at 5000 characters and at most 5 bubbles are sent per "
             "reply, so keep responses concise. Image/audio/video sending "
             "requires LINE_PUBLIC_URL configured to a publicly reachable HTTPS "
-            "host. Slow responses surface a postback button the user taps "
-            "to fetch the reply via a fresh free token."
+            "host. Document/file attachments (PDF, docs, etc.) are delivered "
+            "as HTTPS download links via the same public URL; local filesystem "
+            "paths must never be written into chat text. Slow responses surface "
+            "a postback button the user taps to fetch the reply via a fresh "
+            "free token."
         ),
     )
