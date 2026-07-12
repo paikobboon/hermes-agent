@@ -1192,3 +1192,92 @@ class TestMediaTokenPersistence:
         # Live token survives on disk for the next start.
         data = json.loads((tmp_path / "state" / "line_media_tokens.json").read_text())
         assert live_token in data
+
+
+class TestQuotaParkAndFlush:
+    """Monthly-quota 429s park the payload; the next free reply flushes it.
+
+    2026-07-11/12 incident: quota exhausted mid-month → every push 429'd and
+    the payload was DROPPED, so Lucky went silently mute for proactive/slow
+    sends. Now quota-429'd payloads park per chat and ride the next reply
+    token. FORK DELTA 2026-07-13.
+    """
+
+    QUOTA_ERR = Exception('LINE push 429: {"message":"You have reached your monthly limit."}')
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+        })
+        ad = LineAdapter(cfg)
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        return ad
+
+    def test_quota_429_parks_instead_of_failing(self):
+        ad = self._adapter()
+        ad._client.push = AsyncMock(side_effect=self.QUOTA_ERR)
+        result = asyncio.run(ad.send("C1", "hello family"))
+        assert result.success, "park must report success to stop fallback churn"
+        assert len(ad._quota_parked["C1"]) == 1
+        ad._client.push.assert_awaited_once()  # no plain-text fallback re-push
+
+    def test_next_reply_flushes_parked_before_new(self):
+        ad = self._adapter()
+        ad._client.push = AsyncMock(side_effect=self.QUOTA_ERR)
+        asyncio.run(ad.send("C1", "parked one"))
+        # Fresh inbound → reply token available.
+        ad._reply_tokens["C1"] = ("rtok", time.time() + 40)
+        ad._client.push = AsyncMock()
+        result = asyncio.run(ad.send("C1", "live answer"))
+        assert result.success
+        ad._client.reply.assert_awaited_once()
+        _, sent = ad._client.reply.await_args.args
+        texts = [m["text"] for m in sent if m.get("type") == "text"]
+        assert texts == ["parked one", "live answer"]  # oldest parked first
+        assert "C1" not in ad._quota_parked
+
+    def test_new_messages_take_priority_within_cap(self):
+        ad = self._adapter()
+        ad._quota_parked["C1"] = [{"type": "text", "text": f"p{i}"} for i in range(5)]
+        merged = ad._merge_parked_for_reply(
+            "C1", [{"type": "text", "text": "new1"}, {"type": "text", "text": "new2"}]
+        )
+        assert [m["text"] for m in merged] == ["p0", "p1", "p2", "new1", "new2"]
+        assert [m["text"] for m in ad._quota_parked["C1"]] == ["p3", "p4"]
+
+    def test_park_cap_drops_oldest(self):
+        ad = self._adapter()
+        for i in range(12):
+            ad._park_for_quota("C1", [{"type": "text", "text": f"m{i}"}])
+        parked = [m["text"] for m in ad._quota_parked["C1"]]
+        assert len(parked) == 10
+        assert parked[0] == "m2" and parked[-1] == "m11"
+
+    def test_duplicate_retry_batch_not_double_parked(self):
+        ad = self._adapter()
+        batch = [{"type": "text", "text": "same"}]
+        ad._park_for_quota("C1", batch)
+        ad._park_for_quota("C1", list(batch))
+        assert len(ad._quota_parked["C1"]) == 1
+
+    def test_non_quota_push_error_still_fails(self):
+        ad = self._adapter()
+        ad._client.push = AsyncMock(side_effect=Exception("boom 500"))
+        result = asyncio.run(ad.send("C1", "hello"))
+        assert not result.success
+        assert not ad._quota_parked
+
+    def test_prebuilt_media_quota_429_parks_whole_payload(self):
+        ad = self._adapter()
+        ad._client.push = AsyncMock(side_effect=self.QUOTA_ERR)
+        msgs = [
+            {"type": "image", "originalContentUrl": "https://x/1.png", "previewImageUrl": "https://x/1.png"},
+            {"type": "text", "text": "caption"},
+        ]
+        result = asyncio.run(ad._send_messages("C1", msgs))
+        assert result.success
+        assert len(ad._quota_parked["C1"]) == 2

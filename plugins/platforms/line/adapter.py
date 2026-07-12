@@ -166,6 +166,11 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 # matching the gateway's 24h image-cache cleanup). FORK DELTA 2026-07-12.
 MEDIA_TOKEN_TTL_SECONDS = 1800  # upstream default; see LINE_MEDIA_TTL_SECONDS env
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
+# When the OA's monthly push quota is exhausted (LINE 429 "monthly limit"),
+# pushed payloads are PARKED per chat and ride the next free reply token
+# instead of being dropped. Cap bounds memory; overflow drops OLDEST (logged,
+# never silent). FORK DELTA 2026-07-13.
+QUOTA_PARK_MAX_PER_CHAT = 10
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 
 # Sender/chat identity resolution
@@ -1451,6 +1456,12 @@ class LineAdapter(BasePlatformAdapter):
         self._media_token_store = _media_token_store_path()
         self._load_media_tokens()
 
+        # Quota-exhaustion parking: chat_id → prebuilt message objects awaiting
+        # a free reply token (see _park_for_quota). In-memory only — a restart
+        # drops parked payloads, which is acceptable staleness for chat
+        # messages. FORK DELTA 2026-07-13.
+        self._quota_parked: Dict[str, List[Dict[str, Any]]] = {}
+
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
@@ -2148,6 +2159,8 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         token, used_reply = self._consume_reply_token(chat_id)
+        if used_reply and not force_push:
+            messages = self._merge_parked_for_reply(chat_id, messages)
         logger.info("LINE SEND site=text kind=%s chat=%s n=%d", "reply" if (used_reply and not force_push) else "push", chat_id, len(messages))
         if used_reply and not force_push:
             try:
@@ -2164,7 +2177,70 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
+            if self._is_quota_429(exc):
+                # Park instead of failing: success=True stops the caller's
+                # plain-text push fallback (it would 429 too and double-park).
+                self._park_for_quota(chat_id, messages)
+                return SendResult(success=True, message_id=None)
             return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _is_quota_429(exc: BaseException) -> bool:
+        """True for LINE's monthly-push-quota 429 (not generic rate limits).
+        FORK DELTA 2026-07-13."""
+        text = str(exc)
+        return "429" in text and "monthly limit" in text.lower()
+
+    def _park_for_quota(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Park undeliverable pushed messages until a free reply token arrives.
+
+        With the monthly push quota exhausted every push 429s for the rest of
+        the calendar month; dropping the payload made Lucky silently mute
+        (2026-07-11/12 incident). Parked messages ride the next reply-token
+        send for the chat via _merge_parked_for_reply. FORK DELTA 2026-07-13.
+        """
+        parked = self._quota_parked.setdefault(chat_id, [])
+        if messages and parked[-len(messages):] == messages:
+            return  # retry of the batch we just parked — don't duplicate
+        parked.extend(messages)
+        overflow = len(parked) - QUOTA_PARK_MAX_PER_CHAT
+        if overflow > 0:
+            del parked[:overflow]
+            logger.warning(
+                "LINE: quota-park overflow for chat %s — dropped %d oldest parked message(s)",
+                chat_id, overflow,
+            )
+        logger.warning(
+            "LINE: monthly push quota exhausted — parked %d message(s) for chat %s "
+            "to ride the next free reply token (%d parked total)",
+            len(messages), chat_id, len(parked),
+        )
+
+    def _merge_parked_for_reply(
+        self, chat_id: str, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Prepend parked messages onto a reply-token send, oldest first.
+
+        The current turn's messages always all go (they answer the live
+        question); parked ones fill the remaining slots up to LINE's
+        5-messages-per-call cap, leftovers stay parked. FORK DELTA 2026-07-13.
+        """
+        parked = self._quota_parked.get(chat_id)
+        if not parked:
+            return messages
+        room = LINE_MAX_MESSAGES_PER_CALL - len(messages)
+        if room <= 0:
+            return messages
+        flush, remainder = parked[:room], parked[room:]
+        if remainder:
+            self._quota_parked[chat_id] = remainder
+        else:
+            self._quota_parked.pop(chat_id, None)
+        logger.info(
+            "LINE: flushing %d parked message(s) for chat %s on a free reply token (%d still parked)",
+            len(flush), chat_id, len(remainder),
+        )
+        return flush + messages
 
     def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
         """Consume a stashed reply token if present and unexpired.
@@ -2572,7 +2648,10 @@ class LineAdapter(BasePlatformAdapter):
 
         # First batch: try reply token, fall back to push.
         token, used_reply = self._consume_reply_token(chat_id)
-        logger.info("LINE SEND site=prebuilt kind=%s chat=%s n=%d", "reply" if used_reply else "push", chat_id, len(messages))
+        if used_reply:
+            # Helper caps the merged batch at LINE's 5-per-call limit.
+            first_batch = self._merge_parked_for_reply(chat_id, first_batch)
+        logger.info("LINE SEND site=prebuilt kind=%s chat=%s n=%d", "reply" if used_reply else "push", chat_id, len(first_batch) + len(rest))
         if used_reply:
             try:
                 response = await self._client.reply(token, first_batch)
@@ -2583,12 +2662,18 @@ class LineAdapter(BasePlatformAdapter):
                     response = await self._client.push(chat_id, first_batch)
                     self._remember_sent_message_texts(chat_id, response, first_batch)
                 except Exception as exc2:
+                    if self._is_quota_429(exc2):
+                        self._park_for_quota(chat_id, first_batch + rest)
+                        return SendResult(success=True, message_id=None)
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
                 response = await self._client.push(chat_id, first_batch)
                 self._remember_sent_message_texts(chat_id, response, first_batch)
             except Exception as exc:
+                if self._is_quota_429(exc):
+                    self._park_for_quota(chat_id, first_batch + rest)
+                    return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error=str(exc))
 
         # Subsequent batches: always push (reply token is single-use).
@@ -2600,6 +2685,9 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_message_texts(chat_id, response, batch)
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
+                if self._is_quota_429(exc):
+                    self._park_for_quota(chat_id, batch + rest)
+                    return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error=str(exc))
 
         return SendResult(success=True, message_id=None)

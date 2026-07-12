@@ -29,6 +29,12 @@ Below: the original pre-migration per-delta ledger, retained for lineage (anchor
 > Upstream is fetch-only: push URLs on `origin` are deliberately dead, and
 > `gh pr/issue create` + `*nousresearch*` are deny-listed in every profile.
 
+## Deltas (2026-07-13 — quota park-and-flush)
+
+| Commit | What | Re-apply anchor | Pinning test |
+|---|---|---|---|
+| `local` | Quota-exhaustion park-and-flush — when the OA's monthly push quota is spent (LINE 429 "monthly limit"; hit 2026-07-11 with 19 days left), every push fails for the rest of the calendar month and the payload was DROPPED → Lucky silently mute for slow-turn/proactive sends. Now: quota-429'd payloads (text + prebuilt/media, all three push branches) park per chat (`_quota_parked`, cap 10/chat, oldest dropped WITH a warning, exact-retry dedupe) and ride the next free reply token — `_merge_parked_for_reply` prepends oldest-first, current turn's messages always take priority within LINE's 5-per-call cap, leftovers stay parked. Park returns success=True deliberately: stops base.py's plain-text push fallback from 429ing again and double-parking. Non-quota push errors unchanged. In-memory only (restart drops parked — acceptable staleness for chat). | `_is_quota_429` / `_park_for_quota` / `_merge_parked_for_reply` + `QUOTA_PARK_MAX_PER_CHAT` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestQuotaParkAndFlush` (7 cases) |
+
 ## Deltas (2026-07-12 — unopenable-images fix)
 
 | Commit | What | Re-apply anchor | Pinning test |
