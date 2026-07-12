@@ -160,7 +160,11 @@ DEFAULT_DELIVERED_TEXT = "Already replied ✅"
 DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 
 # Media defaults
-MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
+# LINE clients fetch originalContentUrl when the recipient taps the image,
+# which can be hours after send — a short TTL turns older images into
+# "can't open" errors. Env-tunable per profile (lucky runs 86400 = 24h,
+# matching the gateway's 24h image-cache cleanup). FORK DELTA 2026-07-12.
+MEDIA_TOKEN_TTL_SECONDS = 1800  # upstream default; see LINE_MEDIA_TTL_SECONDS env
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 
@@ -971,6 +975,23 @@ def _append_text_messages(messages: List[Dict[str, Any]], text: str) -> None:
         messages.append(_text_message(chunk))
 
 
+def _media_token_store_path() -> Optional[str]:
+    """Where persisted media-serving tokens live (``<profile>/state/line_media_tokens.json``).
+
+    ``HERMES_PROFILE_DIR`` override (explicit deployments / tests) wins; else
+    the lucky profile when present (mirrors the ``_MessageDeduplicator``
+    persist-path idiom in ``__init__``). ``None`` → in-memory only.
+    FORK DELTA 2026-07-12.
+    """
+    override = os.environ.get("HERMES_PROFILE_DIR")
+    if override:
+        return os.path.join(override, "state", "line_media_tokens.json")
+    lucky = os.path.expanduser("~/.hermes/profiles/lucky")
+    if os.path.isdir(lucky):
+        return os.path.join(lucky, "state", "line_media_tokens.json")
+    return None
+
+
 def _flex_cache_dir() -> Path:
     """Resolve the active profile's Flex-message cache dir (``<profile>/cache/flex``).
 
@@ -1420,7 +1441,15 @@ class LineAdapter(BasePlatformAdapter):
         # Media state
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
         self._media_temp_paths: Set[str] = set()
-        self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
+        # TTL is env-tunable: a token that dies before the family taps the
+        # image renders it unopenable (LINE fetches on tap, not at send).
+        # FORK DELTA 2026-07-12.
+        try:
+            self._media_ttl = float(os.getenv("LINE_MEDIA_TTL_SECONDS") or MEDIA_TOKEN_TTL_SECONDS)
+        except (TypeError, ValueError):
+            self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
+        self._media_token_store = _media_token_store_path()
+        self._load_media_tokens()
 
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
@@ -1548,14 +1577,23 @@ class LineAdapter(BasePlatformAdapter):
             self._runner = None
         self._app = None
 
-        # Cleanup any tracked tempfiles.
+        # Persist tokens, then drop only EXPIRED temp previews: LINE clients
+        # still fetch a just-sent image after a restart, so live tokens and
+        # their preview files must survive teardown (rehydrated by
+        # _load_media_tokens on the next start). FORK DELTA 2026-07-12.
+        self._save_media_tokens()
+        _now = time.time()
         for path in list(self._media_temp_paths):
+            _live = any(
+                p == path and exp > _now for p, exp in self._media_tokens.values()
+            )
+            if _live:
+                continue
             try:
                 os.unlink(path)
             except OSError:
                 pass
-        self._media_temp_paths.clear()
-        self._media_tokens.clear()
+            self._media_temp_paths.discard(path)
 
         if self._lock_key:
             try:
@@ -2245,6 +2283,55 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound media (image / voice / video)
     # ------------------------------------------------------------------
 
+    def _load_media_tokens(self) -> None:
+        """Rehydrate persisted media-serving tokens so restarts don't break sent images.
+
+        The LINE app fetches ``originalContentUrl`` when a family member taps
+        the image — often long after a safe-restart. Losing the in-memory
+        token map turned every earlier image into a 404 ("can't open").
+        Store format: ``{token: [path, expiry, is_temp]}`` (legacy 2-field
+        entries tolerated). Expired or missing-file entries are dropped.
+        FORK DELTA 2026-07-12.
+        """
+        path = self._media_token_store
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                return
+            now = time.time()
+            for token, entry in data.items():
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                file_p, expires_at = str(entry[0]), float(entry[1])
+                if expires_at <= now or not os.path.isfile(file_p):
+                    continue
+                self._media_tokens[token] = (file_p, expires_at)
+                if len(entry) >= 3 and entry[2]:
+                    self._media_temp_paths.add(file_p)
+        except Exception as exc:
+            logger.warning("LINE: failed to load media token store: %s", exc)
+
+    def _save_media_tokens(self) -> None:
+        """Persist the media token map (atomic write; best-effort). FORK DELTA 2026-07-12."""
+        path = self._media_token_store
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {
+                token: [p, exp, p in self._media_temp_paths]
+                for token, (p, exp) in self._media_tokens.items()
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("LINE: failed to persist media token store: %s", exc)
+
     def _register_media(self, file_path: str, *, cleanup: bool = False) -> str:
         """Register a local file for HTTPS serving; return the URL token."""
         # Evict expired tokens first.
@@ -2265,6 +2352,7 @@ class LineAdapter(BasePlatformAdapter):
         self._media_tokens[token] = (resolved, now + self._media_ttl)
         if cleanup:
             self._media_temp_paths.add(resolved)
+        self._save_media_tokens()
         return token
 
     def _media_url(self, token: str, filename: str) -> str:

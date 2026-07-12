@@ -1111,3 +1111,84 @@ class TestLinePreview:
         with open(preview, "rb") as fh:
             assert fh.read(3) == b"\xff\xd8\xff", "preview must be JPEG"
         _os.unlink(preview)
+
+
+class TestMediaTokenPersistence:
+    """Media-serving tokens must survive restarts and honor a long TTL.
+
+    LINE clients fetch originalContentUrl when the recipient TAPS the image —
+    often long after the send. Before this delta, tokens lived only in memory
+    with a 30-min TTL and were cleared on disconnect, so any tap after a
+    safe-restart (or >30 min) returned 404/410: "can't open this image."
+    FORK DELTA 2026-07-12.
+    """
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+        })
+        return LineAdapter(cfg)
+
+    def test_media_ttl_env_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(tmp_path))
+        monkeypatch.setenv("LINE_MEDIA_TTL_SECONDS", "86400")
+        ad = self._make_adapter()
+        assert ad._media_ttl == 86400.0
+
+    def test_media_tokens_persist_across_adapter_restart(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(tmp_path))
+        monkeypatch.delenv("LINE_MEDIA_TTL_SECONDS", raising=False)
+        img = tmp_path / "img.png"
+        img.write_bytes(b"\x89PNG fake")
+
+        ad1 = self._make_adapter()
+        token = ad1._register_media(str(img))
+        store = tmp_path / "state" / "line_media_tokens.json"
+        assert store.is_file(), "register must persist the token store"
+
+        # A fresh adapter (post-restart) rehydrates the same token → path.
+        ad2 = self._make_adapter()
+        assert token in ad2._media_tokens
+        assert ad2._media_tokens[token][0] == str(img.resolve())
+
+    def test_load_drops_expired_and_missing_file_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(tmp_path))
+        img = tmp_path / "img.png"
+        img.write_bytes(b"\x89PNG fake")
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / "line_media_tokens.json").write_text(json.dumps({
+            "expired": [str(img), time.time() - 10, False],
+            "missing": [str(tmp_path / "gone.png"), time.time() + 3600, False],
+            "live": [str(img), time.time() + 3600, False],
+        }), encoding="utf-8")
+
+        ad = self._make_adapter()
+        assert "live" in ad._media_tokens
+        assert "expired" not in ad._media_tokens
+        assert "missing" not in ad._media_tokens
+
+    def test_disconnect_preserves_live_tokens_and_previews(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(tmp_path))
+        monkeypatch.setenv("LINE_MEDIA_TTL_SECONDS", "86400")
+        live_preview = tmp_path / "line_preview_live.jpg"
+        live_preview.write_bytes(b"\xff\xd8\xff live")
+        dead_preview = tmp_path / "line_preview_dead.jpg"
+        dead_preview.write_bytes(b"\xff\xd8\xff dead")
+
+        ad = self._make_adapter()
+        live_token = ad._register_media(str(live_preview), cleanup=True)
+        dead_token = ad._register_media(str(dead_preview), cleanup=True)
+        # Force-expire the dead preview's token.
+        path, _ = ad._media_tokens[dead_token]
+        ad._media_tokens[dead_token] = (path, time.time() - 10)
+
+        asyncio.run(ad.disconnect())
+
+        assert live_preview.exists(), "live preview must survive disconnect"
+        assert not dead_preview.exists(), "expired preview must be cleaned"
+        # Live token survives on disk for the next start.
+        data = json.loads((tmp_path / "state" / "line_media_tokens.json").read_text())
+        assert live_token in data

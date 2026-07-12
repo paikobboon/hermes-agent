@@ -29,6 +29,12 @@ Below: the original pre-migration per-delta ledger, retained for lineage (anchor
 > Upstream is fetch-only: push URLs on `origin` are deliberately dead, and
 > `gh pr/issue create` + `*nousresearch*` are deny-listed in every profile.
 
+## Deltas (2026-07-12 — unopenable-images fix)
+
+| Commit | What | Re-apply anchor | Pinning test |
+|---|---|---|---|
+| `local` | Media-serving tokens persist + long TTL — sent LINE images stayed openable only ~30 min and died on every restart (tokens were in-memory, TTL 1800s, cleared+temp-unlinked on `disconnect()`; the LINE app fetches `originalContentUrl` on TAP, not at send → family got "can't open this image"). Now: token map persists to `<profile>/state/line_media_tokens.json` (atomic write on register/disconnect, rehydrated on init, expired/missing-file entries dropped on load; store format `{token: [path, expiry, is_temp]}`), TTL env-tunable via `LINE_MEDIA_TTL_SECONDS` (lucky `.env` sets 86400 = 24h, matching the gateway's 24h image-cache cleanup), and `disconnect()` keeps live tokens + unexpired preview temp files (only expired previews are unlinked). Residual ceiling: `cleanup_image_cache(max_age_hours=24)` in `gateway/run.py` still deletes the underlying files at 24h — an image tapped for the FIRST time >24h after send can still 404 (upstream call site, deliberately untouched). | `_media_token_store_path` / `_load_media_tokens` / `_save_media_tokens` + `LINE_MEDIA_TTL_SECONDS` read in `__init__` in `plugins/platforms/line/adapter.py` | `tests/gateway/test_line_plugin.py::TestMediaTokenPersistence` (4 cases) |
+
 ## Deltas (2026-07-06/07 hardening wave)
 
 | Commit | What | Re-apply anchor | Pinning test |
