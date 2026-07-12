@@ -3998,6 +3998,24 @@ class BasePlatformAdapter(ABC):
         _LOCAL_MEDIA_EXTS = MEDIA_DELIVERY_EXTS
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
 
+        # LLMs sometimes emit generated files as code-interpreter-style links
+        # — "[label](sandbox:/path/img.png)". The URL-protecting lookbehind
+        # below treats "sandbox:/…" as a URL scheme and skips it, so the file
+        # never ships natively and the raw markdown leaks to the chat as
+        # literal text. The pseudo-scheme has no meaning outside the model's
+        # imagined sandbox — strip it (outside code spans, which must never
+        # be mutated) so the path joins normal bare-path extraction.
+        # FORK DELTA 2026-07-12.
+        _pre_spans = [
+            (m.start(), m.end())
+            for m in re.finditer(r'```[^\n]*\n.*?```|`[^`\n]+`', content, re.DOTALL)
+        ]
+        content = re.sub(
+            r'\bsandbox:(?=~?/)',
+            lambda m: m.group(0) if any(s <= m.start() < e for s, e in _pre_spans) else '',
+            content,
+        )
+
         # (?<![/:\w.]) prevents matching inside URLs (e.g. https://…/img.png)
         #             and relative paths (./foo.png)
         # (?:~/|/)    anchors to absolute or home-relative Unix paths
@@ -4057,13 +4075,15 @@ class BasePlatformAdapter(ABC):
                     flags=re.MULTILINE,
                 )
                 cleaned = cleaned.replace(raw, '')
+            # `!?` — plain markdown links leave the same husk as image links
+            # once their (sandbox:)path target is stripped. FORK DELTA 2026-07-12.
             cleaned = re.sub(
-                r'^[^\S\n]*!\[[^\]]*\]\(\s*\)[^\S\n]*(?:\n|$)',
+                r'^[^\S\n]*!?\[[^\]]*\]\(\s*\)[^\S\n]*(?:\n|$)',
                 '',
                 cleaned,
                 flags=re.MULTILINE,
             )
-            cleaned = re.sub(r'!\[[^\]]*\]\(\s*\)', '', cleaned)
+            cleaned = re.sub(r'!?\[[^\]]*\]\(\s*\)', '', cleaned)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         return paths, cleaned

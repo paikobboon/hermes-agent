@@ -399,3 +399,47 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestSandboxSchemeLinks:
+    """LLM code-interpreter-style "sandbox:" links must ship natively.
+
+    Lucky group incident 2026-07-12: the model emitted
+    "[label](sandbox:/…/img.png)"; the URL-protecting lookbehind treated
+    "sandbox:/" as a URL scheme, so the image never shipped and the raw
+    markdown leaked to the family chat. FORK DELTA 2026-07-12.
+    """
+
+    def test_sandbox_markdown_link_extracts_and_cleans(self):
+        content = (
+            "มาแล้วค่ะ ลองอีกครั้งนะคะ\n"
+            "[ภาพลัคกี้](sandbox:/Users/jarvis/.hermes/profiles/lucky/cache/images/img.png)"
+        )
+        paths, cleaned = _extract(content)
+        assert paths == [
+            "/Users/jarvis/.hermes/profiles/lucky/cache/images/img.png"
+        ]
+        assert "sandbox:" not in cleaned
+        assert "img.png" not in cleaned
+        assert "](" not in cleaned  # no empty-link husk
+        assert "มาแล้วค่ะ ลองอีกครั้งนะคะ" in cleaned
+
+    def test_bare_sandbox_path_extracts(self):
+        paths, cleaned = _extract("here: sandbox:/tmp/chart.png")
+        assert paths == ["/tmp/chart.png"]
+        assert "sandbox:" not in cleaned
+
+    def test_sandbox_tilde_path_extracts(self):
+        paths, _ = _extract("sandbox:~/pics/cat.jpg")
+        assert paths == ["/home/user/pics/cat.jpg"]
+
+    def test_sandbox_inside_inline_code_is_untouched(self):
+        content = "use `sandbox:/tmp/example.png` as the marker"
+        paths, cleaned = _extract(content)
+        assert paths == []
+        assert cleaned == content  # code sample never mutated
+
+    def test_real_urls_still_rejected(self):
+        paths, cleaned = _extract("see https://example.com/sandbox/img.png")
+        assert paths == []
+        assert cleaned == "see https://example.com/sandbox/img.png"
