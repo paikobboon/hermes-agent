@@ -7626,16 +7626,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Send the agent's reply to the destination. Route to the new
         # thread if we created one; otherwise the configured home channel
-        # (which may itself carry a thread_id).
+        # (which may itself carry a thread_id). Agent replies can carry
+        # media paths — converge on the shared assembly rail so they ship
+        # natively instead of leaking as literal text. FORK DELTA 2026-07-12.
         send_metadata: Dict[str, Any] = {}
         if effective_thread_id:
             send_metadata["thread_id"] = effective_thread_id
         try:
-            result = await adapter.send(
-                chat_id=str(home.chat_id),
-                content=response_text,
-                metadata=send_metadata or None,
-            )
+            result = None
+            _reply_text = response_text
+            if getattr(adapter, "assemble_and_send_media", None):
+                _reply_text = await adapter.assemble_and_send_media(
+                    str(home.chat_id),
+                    response_text,
+                    metadata=send_metadata or None,
+                )
+            if _reply_text and _reply_text.strip():
+                result = await adapter.send(
+                    chat_id=str(home.chat_id),
+                    content=_reply_text,
+                    metadata=send_metadata or None,
+                )
         except Exception as exc:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
 
