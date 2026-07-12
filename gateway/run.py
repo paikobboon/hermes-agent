@@ -229,6 +229,34 @@ def _non_conversational_metadata(
     return merged
 
 
+async def deliver_response_with_media(
+    adapter: Any,
+    chat_id: str,
+    response: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Deliver an agent response through the shared outbound media assembly.
+
+    Any delivery path that hands raw agent text to ``adapter.send()`` skips
+    media extraction entirely — MEDIA: tags, markdown image links, and
+    bare/sandbox file paths then leak to the chat as literal text and the
+    file never ships (Lucky group incident 2026-07-12 22:43, the queued
+    follow-up "first response" lane). Media-capable adapters expose
+    ``assemble_and_send_media`` (interactive + cron already converge on it);
+    this helper brings side-channel text deliveries onto the same rail.
+    FORK DELTA 2026-07-12.
+    """
+    text = response
+    if getattr(adapter, "assemble_and_send_media", None):
+        text = await adapter.assemble_and_send_media(
+            chat_id,
+            response,
+            metadata=metadata,
+        )
+    if text and text.strip():
+        await adapter.send(chat_id, text, metadata=metadata)
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -19721,7 +19749,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
+                            await deliver_response_with_media(
+                                adapter,
                                 source.chat_id,
                                 first_response,
                                 metadata=_status_thread_metadata,
