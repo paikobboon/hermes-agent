@@ -365,12 +365,13 @@ class TestRegistryIntegration:
 
     def test_schema_exposes_expected_agent_params(self, image_tool):
         """The agent-facing schema exposes the unified text+image surface:
-        prompt (required), aspect_ratio, and the image-to-image inputs
-        image_url + reference_image_urls. Model selection stays a user-level
-        config choice, never an agent-level arg."""
+        prompt (required), aspect_ratio, the named character selector, and the
+        image-to-image inputs image_url + reference_image_urls. Model selection
+        stays a user-level config choice, never an agent-level arg."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
         assert set(props.keys()) == {
             "prompt", "aspect_ratio", "image_url", "reference_image_urls",
+            "character",
         }
         assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
 

@@ -30,6 +30,19 @@ class _FakeCodexProvider(ImageGenProvider):
         }
 
 
+class _CapturingCodexProvider(_FakeCodexProvider):
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, prompt, aspect_ratio="landscape", **kwargs):
+        self.calls.append({
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            **kwargs,
+        })
+        return super().generate(prompt, aspect_ratio, **kwargs)
+
+
 class TestPluginDispatch:
     def test_dispatch_routes_to_codex_provider(self, monkeypatch, tmp_path):
         from tools import image_generation_tool
@@ -51,6 +64,60 @@ class TestPluginDispatch:
         assert payload["provider"] == "codex"
         assert payload["image"] == "/tmp/codex-test.png"
         assert payload["aspect_ratio"] == "square"
+
+    def test_named_character_resolves_canonical_reference_first(self, monkeypatch, tmp_path):
+        from tools import image_generation_tool
+        from agent import image_gen_registry as registry_module
+        from hermes_cli import plugins as plugins_module
+
+        pack_dir = tmp_path / "characters" / "blip"
+        pack_dir.mkdir(parents=True)
+        (pack_dir / "character.md").write_text(
+            "# Blip\n\n## Prompt spec\n\n> rounded robot with one antenna\n",
+            encoding="utf-8",
+        )
+        canonical = pack_dir / "reference.png"
+        canonical.write_bytes(b"canonical")
+        style_reference = tmp_path / "style.png"
+        style_reference.write_bytes(b"style")
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        provider = _CapturingCodexProvider()
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_model", lambda: None)
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda *args, **kwargs: None)
+        monkeypatch.setattr(registry_module, "get_provider", lambda name: provider if name == "codex" else None)
+        monkeypatch.setattr(image_generation_tool, "_postprocess_image_generate_result", lambda raw, task_id=None: raw)
+
+        raw = image_generation_tool._handle_image_generate({
+            "prompt": "Blip explains LifeOS",
+            "aspect_ratio": "landscape",
+            "character": "Blip",
+            "reference_image_urls": [str(style_reference)],
+        })
+        payload = json.loads(raw)
+
+        assert payload["success"] is True
+        assert payload["character"] == "blip"
+        assert provider.calls[0]["reference_image_urls"] == [
+            str(canonical.resolve()),
+            str(style_reference),
+        ]
+        assert provider.calls[0]["prompt"].startswith("Blip explains LifeOS")
+        assert "CHARACTER LOCK — blip" in provider.calls[0]["prompt"]
+
+    def test_named_character_rejects_paths_before_dispatch(self, monkeypatch, tmp_path):
+        from tools import image_generation_tool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        raw = image_generation_tool._handle_image_generate({
+            "prompt": "draw it",
+            "character": "../../secret",
+        })
+        payload = json.loads(raw)
+
+        assert payload["success"] is False
+        assert payload["error_type"] == "invalid_character"
 
     def test_dispatch_reports_missing_registered_provider(self, monkeypatch, tmp_path):
         from tools import image_generation_tool

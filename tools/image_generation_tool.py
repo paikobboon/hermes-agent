@@ -835,6 +835,20 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _annotate_character_result(raw: str, character: str | None) -> str:
+    """Attach the resolved pack name to successful provider results."""
+    if not character:
+        return raw
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return raw
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return raw
+    payload.setdefault("character", character)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def image_generate_tool(
     prompt: str,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
@@ -1177,7 +1191,9 @@ IMAGE_GENERATE_SCHEMA = {
         "edit / transform an existing image (image-to-image) when the active "
         "model supports it. Pass `image_url` to edit that image; add "
         "`reference_image_urls` for style/composition references; omit both "
-        "for text-to-image. The underlying backend (FAL, OpenAI, xAI, etc.) "
+        "for text-to-image. Pass an installed `character` name to preserve a "
+        "recurring mascot from its canonical model sheet. The underlying "
+        "backend (FAL, OpenAI, xAI, etc.) "
         "and model are user-configured and not selectable by the agent. "
         "Returns the result in the `image` field — either a URL or an absolute "
         "file path. To show it to the user, reference that path/URL in your "
@@ -1224,6 +1240,14 @@ IMAGE_GENERATE_SCHEMA = {
                     "(style, character, or composition references) to guide an "
                     "image-to-image edit. Supported only by some models and "
                     "capped per-model; the description above indicates the max."
+                ),
+            },
+            "character": {
+                "type": "string",
+                "description": (
+                    "Optional installed character-pack name, such as `blip`. "
+                    "Hermes safely resolves the canonical model sheet and "
+                    "identity specification; never pass a filesystem path."
                 ),
             },
         },
@@ -1517,7 +1541,33 @@ def _handle_image_generate(args, **kw):
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
     image_url = args.get("image_url")
     reference_image_urls = args.get("reference_image_urls")
+    character = args.get("character")
     task_id = kw.get("task_id")
+
+    character_name = None
+    if character is not None:
+        try:
+            from agent.image_character_pack import (
+                CharacterPackError,
+                apply_character_lock,
+                resolve_character_pack,
+            )
+
+            pack = resolve_character_pack(character)
+            character_name = pack.name
+            prompt = apply_character_lock(prompt, pack)
+
+            from agent.image_gen_provider import normalize_reference_images
+
+            extra_references = normalize_reference_images(reference_image_urls) or []
+            reference_image_urls = [str(pack.reference_path), *extra_references]
+        except CharacterPackError as exc:
+            return json.dumps({
+                "success": False,
+                "image": None,
+                "error": str(exc),
+                "error_type": "invalid_character",
+            })
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path). When ``image_gen.provider == "krea"`` this
@@ -1528,6 +1578,7 @@ def _handle_image_generate(args, **kw):
         reference_image_urls=reference_image_urls,
     )
     if dispatched is not None:
+        dispatched = _annotate_character_result(dispatched, character_name)
         return _postprocess_image_generate_result(dispatched, task_id=task_id)
 
     # Managed-mode Krea routing: when no explicit plugin provider is configured
@@ -1541,6 +1592,7 @@ def _handle_image_generate(args, **kw):
         reference_image_urls=reference_image_urls,
     )
     if krea_routed is not None:
+        krea_routed = _annotate_character_result(krea_routed, character_name)
         return _postprocess_image_generate_result(krea_routed, task_id=task_id)
 
     raw = image_generate_tool(
@@ -1549,6 +1601,7 @@ def _handle_image_generate(args, **kw):
         image_url=image_url,
         reference_image_urls=reference_image_urls,
     )
+    raw = _annotate_character_result(raw, character_name)
     return _postprocess_image_generate_result(raw, task_id=task_id)
 
 
