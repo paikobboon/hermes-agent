@@ -136,6 +136,7 @@ LINE_PUSH_POLICIES = {LINE_PUSH_POLICY_ALLOW, LINE_PUSH_POLICY_REPLY_ONLY}
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
+LINE_WEBHOOK_MAX_ACCEPTANCE_FAILURES = 3
 DEFAULT_WEBHOOK_PORT = 8646
 DEFAULT_WEBHOOK_PATH = "/line/webhook"
 DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
@@ -479,11 +480,13 @@ class _MessageDeduplicator:
 
     Optionally persists the seen-set to disk so redeliveries that straddle a
     gateway restart (LINE webhook-redelivery is at-least-once) are still
-    recognized by the fresh process.
+    recognized by the fresh process. Acceptance failures are persisted too so
+    poison events can be capped across restarts.
     """
 
     def __init__(self, max_size: int = 1000, persist_path: Optional[str] = None) -> None:
         self._seen: Dict[str, float] = {}
+        self._failures: Dict[str, Tuple[int, float]] = {}
         self._max = max_size
         self._persist_path = persist_path
         if persist_path:
@@ -491,9 +494,38 @@ class _MessageDeduplicator:
                 with open(persist_path, "r", encoding="utf-8") as fh:
                     loaded = json.load(fh)
                 if isinstance(loaded, dict):
-                    self._seen = {str(k): float(v) for k, v in loaded.items()}
+                    if "seen" in loaded or "failures" in loaded:
+                        seen = loaded.get("seen", {})
+                        failures = loaded.get("failures", {})
+                        if isinstance(seen, dict):
+                            self._seen = {str(k): float(v) for k, v in seen.items()}
+                        if isinstance(failures, dict):
+                            self._failures = self._load_failures(failures)
+                    else:
+                        # Backward-compatible load for the old flat
+                        # {event_id: timestamp} persisted format.
+                        self._seen = {str(k): float(v) for k, v in loaded.items()}
             except (FileNotFoundError, ValueError, OSError):
                 pass  # first run or unreadable state: start empty
+
+    def _load_failures(self, failures: Dict[str, Any]) -> Dict[str, Tuple[int, float]]:
+        loaded: Dict[str, Tuple[int, float]] = {}
+        for key, value in failures.items():
+            try:
+                if isinstance(value, dict):
+                    count = int(value.get("count", 0))
+                    updated = float(value.get("updated", 0.0))
+                elif isinstance(value, (list, tuple)) and len(value) >= 2:
+                    count = int(value[0])
+                    updated = float(value[1])
+                else:
+                    count = int(value)
+                    updated = time.time()
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                loaded[str(key)] = (count, updated)
+        return loaded
 
     def _persist(self) -> None:
         if not self._persist_path:
@@ -501,22 +533,68 @@ class _MessageDeduplicator:
         try:
             tmp = self._persist_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self._seen, fh)
+                json.dump(
+                    {
+                        "seen": self._seen,
+                        "failures": {
+                            k: {"count": count, "updated": updated}
+                            for k, (count, updated) in self._failures.items()
+                        },
+                    },
+                    fh,
+                )
             os.replace(tmp, self._persist_path)
         except OSError:
             pass  # persistence is best-effort; never break dispatch
 
+    def _trim_seen_for_insert(self) -> None:
+        if len(self._seen) < self._max:
+            return
+        # Drop the oldest 10% so we don't trim on every insert.
+        cutoff = sorted(self._seen.values())[len(self._seen) // 10 or 1]
+        self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+
+    def _trim_failures_for_insert(self) -> None:
+        if len(self._failures) < self._max:
+            return
+        cutoff = sorted(updated for _, updated in self._failures.values())[
+            len(self._failures) // 10 or 1
+        ]
+        self._failures = {
+            k: v for k, v in self._failures.items() if v[1] > cutoff
+        }
+
+    def has_seen(self, event_id: str) -> bool:
+        return bool(event_id) and event_id in self._seen
+
+    def mark_seen(self, event_id: str) -> None:
+        if not event_id:
+            return
+        self._trim_seen_for_insert()
+        self._seen[event_id] = time.time()
+        self._failures.pop(event_id, None)
+        self._persist()
+
+    def failure_count(self, event_id: str) -> int:
+        if not event_id:
+            return 0
+        return self._failures.get(event_id, (0, 0.0))[0]
+
+    def record_failure(self, event_id: str) -> int:
+        if not event_id:
+            return 0
+        self._trim_failures_for_insert()
+        count = self.failure_count(event_id) + 1
+        self._failures[event_id] = (count, time.time())
+        self._persist()
+        return count
+
     def is_duplicate(self, event_id: str) -> bool:
         if not event_id:
             return False
-        if event_id in self._seen:
+        if self.has_seen(event_id):
             return True
-        if len(self._seen) >= self._max:
-            # Drop the oldest 10% so we don't trim on every insert.
-            cutoff = sorted(self._seen.values())[len(self._seen) // 10 or 1]
-            self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
-        self._seen[event_id] = time.time()
-        self._persist()
+        self.mark_seen(event_id)
         return False
 
 
@@ -1663,23 +1741,54 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
+        acceptance_failed = False
         for event in events:
+            webhook_event_id = event.get("webhookEventId", "") or ""
+
+            if webhook_event_id and self._dedup.has_seen(webhook_event_id):
+                logger.debug("LINE: ignoring duplicate webhook event %s", webhook_event_id)
+                continue
+
+            if (
+                webhook_event_id
+                and self._dedup.failure_count(webhook_event_id)
+                >= LINE_WEBHOOK_MAX_ACCEPTANCE_FAILURES
+            ):
+                logger.error(
+                    "LINE: dropping LINE webhook event %s after %s failed acceptance attempts",
+                    webhook_event_id,
+                    LINE_WEBHOOK_MAX_ACCEPTANCE_FAILURES,
+                )
+                self._dedup.mark_seen(webhook_event_id)
+                continue
+
             try:
                 await self._dispatch_event(event)
             except Exception:
-                logger.exception("LINE: dispatch_event failed")
+                acceptance_failed = True
+                if webhook_event_id:
+                    attempts = self._dedup.record_failure(webhook_event_id)
+                    logger.exception(
+                        "LINE: dispatch_event failed for webhook event %s "
+                        "(acceptance failure %s/%s)",
+                        webhook_event_id,
+                        attempts,
+                        LINE_WEBHOOK_MAX_ACCEPTANCE_FAILURES,
+                    )
+                else:
+                    logger.exception("LINE: dispatch_event failed")
+                continue
 
+            if webhook_event_id:
+                self._dedup.mark_seen(webhook_event_id)
+
+        if acceptance_failed:
+            return web.Response(status=500, text="acceptance failed")
         return web.Response(status=200, text="ok")
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
         event_type = event.get("type")
         source = event.get("source") or {}
-        webhook_event_id = event.get("webhookEventId", "") or ""
-
-        # Dedup retries (LINE webhooks may be re-delivered).
-        if webhook_event_id and self._dedup.is_duplicate(webhook_event_id):
-            logger.debug("LINE: ignoring duplicate webhook event %s", webhook_event_id)
-            return
 
         # Filter our own messages (self-echo).
         sender_user_id = source.get("userId", "")

@@ -48,6 +48,49 @@ _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
 
 
+class _FakeLineRequest:
+    def __init__(self, body: bytes, signature: str):
+        self._body = body
+        self.headers = {"X-Line-Signature": signature}
+
+    async def read(self) -> bytes:
+        return self._body
+
+
+def _line_signature(body: bytes, secret: str) -> str:
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode()
+
+
+def _line_text_event(event_id: str, text: str = "hello") -> dict:
+    return {
+        "type": "message",
+        "webhookEventId": event_id,
+        "replyToken": f"reply-{event_id}",
+        "source": {"type": "user", "userId": "Uchat"},
+        "message": {"type": "text", "id": f"msg-{event_id}", "text": text},
+    }
+
+
+def _line_webhook_request(secret: str, events: list[dict]) -> _FakeLineRequest:
+    body = json.dumps({"events": events}).encode("utf-8")
+    return _FakeLineRequest(body, _line_signature(body, secret))
+
+
+def _webhook_adapter():
+    from gateway.config import PlatformConfig
+
+    cfg = PlatformConfig(enabled=True, extra={
+        "channel_access_token": "tok",
+        "channel_secret": "sec",
+        "allow_all_users": True,
+        "coalesce_media": False,
+    })
+    ad = LineAdapter(cfg)
+    ad.handle_message = AsyncMock()
+    return ad
+
+
 # ---------------------------------------------------------------------------
 # 1. Signature verification
 # ---------------------------------------------------------------------------
@@ -198,6 +241,86 @@ class TestDedup:
         d = _MessageDeduplicator(persist_path=str(bad))
         assert not d.is_duplicate("evt-x")
         assert d.is_duplicate("evt-x")
+
+
+class TestWebhookAckSemantics:
+
+    def test_dispatch_handoff_failure_returns_5xx_and_does_not_mark_seen(self):
+        ad = _webhook_adapter()
+        ad.handle_message.side_effect = RuntimeError("handoff failed")
+
+        response = asyncio.run(ad._handle_webhook(
+            _line_webhook_request("sec", [_line_text_event("evt-fail")])
+        ))
+
+        assert response.status >= 500
+        assert "evt-fail" not in ad._dedup._seen
+
+    def test_redelivery_after_failed_handoff_is_processed_again(self):
+        ad = _webhook_adapter()
+        ad.handle_message.side_effect = [RuntimeError("handoff failed"), None]
+        request = _line_webhook_request("sec", [_line_text_event("evt-redeliver")])
+
+        first = asyncio.run(ad._handle_webhook(request))
+        second = asyncio.run(ad._handle_webhook(request))
+
+        assert first.status >= 500
+        assert second.status == 200
+        assert ad.handle_message.await_count == 2
+        assert "evt-redeliver" in ad._dedup._seen
+
+    def test_successfully_accepted_redelivery_is_deduped(self):
+        ad = _webhook_adapter()
+        request = _line_webhook_request("sec", [_line_text_event("evt-ok")])
+
+        first = asyncio.run(ad._handle_webhook(request))
+        second = asyncio.run(ad._handle_webhook(request))
+
+        assert first.status == 200
+        assert second.status == 200
+        assert ad.handle_message.await_count == 1
+        assert "evt-ok" in ad._dedup._seen
+
+    def test_mixed_batch_marks_only_successfully_accepted_events(self):
+        ad = _webhook_adapter()
+
+        async def fail_second(event):
+            if event.message_id == "msg-evt-bad":
+                raise RuntimeError("handoff failed")
+
+        ad.handle_message.side_effect = fail_second
+        events = [_line_text_event("evt-good"), _line_text_event("evt-bad")]
+
+        first = asyncio.run(ad._handle_webhook(_line_webhook_request("sec", events)))
+        second = asyncio.run(ad._handle_webhook(_line_webhook_request("sec", events)))
+
+        assert first.status >= 500
+        assert "evt-good" in ad._dedup._seen
+        assert "evt-bad" not in ad._dedup._seen
+        assert second.status >= 500
+        assert [
+            call.args[0].message_id
+            for call in ad.handle_message.await_args_list
+        ] == ["msg-evt-good", "msg-evt-bad", "msg-evt-bad"]
+
+    def test_poison_event_is_dropped_and_acked_after_three_failed_attempts(self, caplog):
+        ad = _webhook_adapter()
+        ad.handle_message.side_effect = RuntimeError("handoff failed")
+        request = _line_webhook_request("sec", [_line_text_event("evt-poison")])
+
+        statuses = [
+            asyncio.run(ad._handle_webhook(request)).status
+            for _ in range(4)
+        ]
+
+        assert statuses == [500, 500, 500, 200]
+        assert ad.handle_message.await_count == 3
+        assert "evt-poison" in ad._dedup._seen
+        assert any(
+            "dropping LINE webhook event evt-poison after 3 failed acceptance attempts"
+            in record.message
+            for record in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
