@@ -130,6 +130,9 @@ LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
 LINE_RECENT_MESSAGE_CACHE_SIZE = 200
+LINE_PUSH_POLICY_ALLOW = "allow"
+LINE_PUSH_POLICY_REPLY_ONLY = "reply_only"
+LINE_PUSH_POLICIES = {LINE_PUSH_POLICY_ALLOW, LINE_PUSH_POLICY_REPLY_ONLY}
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -1270,6 +1273,16 @@ def _text_setting(env_name: str, extra_value: Any, default: str) -> str:
     return value or default
 
 
+def _push_policy_setting(env_name: str, extra_value: Any, default: str) -> str:
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = extra_value
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    return value if value in LINE_PUSH_POLICIES else default
+
+
 def _text_choices(
     env_name: str,
     plural_value: Any,
@@ -1362,6 +1375,11 @@ class LineAdapter(BasePlatformAdapter):
         self.allowed_rooms = _csv_set(
             os.getenv("LINE_ALLOWED_ROOMS", "")
         ) | set(extra.get("allowed_rooms", []))
+        self.push_policy = _push_policy_setting(
+            "LINE_PUSH_POLICY",
+            extra.get("push_policy"),
+            LINE_PUSH_POLICY_ALLOW,
+        )
 
         # Slow-LLM postback button threshold
         try:
@@ -2158,18 +2176,38 @@ class LineAdapter(BasePlatformAdapter):
         if not messages:
             return SendResult(success=True, message_id=None)
 
-        token, used_reply = self._consume_reply_token(chat_id)
-        if used_reply and not force_push:
+        reply_kind = ""
+        token = ""
+        if not force_push:
+            token, reply_kind = self._take_reply_token(
+                chat_id,
+                allow_late=self._reply_only_push_policy(),
+            )
+        if reply_kind:
             messages = self._merge_parked_for_reply(chat_id, messages)
-        logger.info("LINE SEND site=text kind=%s chat=%s n=%d", "reply" if (used_reply and not force_push) else "push", chat_id, len(messages))
-        if used_reply and not force_push:
+        send_kind = reply_kind or (
+            "park" if self._reply_only_push_policy() and not force_push else "push"
+        )
+        logger.info(
+            "LINE SEND site=text kind=%s chat=%s n=%d",
+            send_kind, chat_id, len(messages),
+        )
+        if reply_kind:
             try:
                 response = await self._client.reply(token, messages)
                 self._remember_sent_message_texts(chat_id, response, messages)
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
+                if self._reply_only_push_policy():
+                    logger.info("LINE: reply token rejected (%s); parking without push", exc)
+                    self._park_for_quota(chat_id, messages, reason="reply_only")
+                    return SendResult(success=True, message_id=None)
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
+
+        if self._reply_only_push_policy() and not force_push:
+            self._park_for_quota(chat_id, messages, reason="reply_only")
+            return SendResult(success=True, message_id=None)
 
         try:
             response = await self._client.push(chat_id, messages)
@@ -2191,7 +2229,13 @@ class LineAdapter(BasePlatformAdapter):
         text = str(exc)
         return "429" in text and "monthly limit" in text.lower()
 
-    def _park_for_quota(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    def _park_for_quota(
+        self,
+        chat_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        reason: str = "quota",
+    ) -> None:
         """Park undeliverable pushed messages until a free reply token arrives.
 
         With the monthly push quota exhausted every push 429s for the rest of
@@ -2210,11 +2254,18 @@ class LineAdapter(BasePlatformAdapter):
                 "LINE: quota-park overflow for chat %s — dropped %d oldest parked message(s)",
                 chat_id, overflow,
             )
-        logger.warning(
-            "LINE: monthly push quota exhausted — parked %d message(s) for chat %s "
-            "to ride the next free reply token (%d parked total)",
-            len(messages), chat_id, len(parked),
-        )
+        if reason == "reply_only":
+            logger.info(
+                "LINE: parked (push_policy=reply_only) %d message(s) for chat %s "
+                "to ride the next free reply token (%d parked total)",
+                len(messages), chat_id, len(parked),
+            )
+        else:
+            logger.warning(
+                "LINE: monthly push quota exhausted — parked %d message(s) for chat %s "
+                "to ride the next free reply token (%d parked total)",
+                len(messages), chat_id, len(parked),
+            )
 
     def _merge_parked_for_reply(
         self, chat_id: str, messages: List[Dict[str, Any]]
@@ -2247,13 +2298,29 @@ class LineAdapter(BasePlatformAdapter):
 
         Returns ``(token, used_reply)``.
         """
+        token, kind = self._take_reply_token(chat_id, allow_late=False)
+        return token, bool(kind)
+
+    def _take_reply_token(self, chat_id: str, *, allow_late: bool) -> Tuple[str, str]:
+        """Consume a reply token, optionally allowing one expired-token try.
+
+        Returns ``(token, kind)`` where kind is ``reply`` or ``reply-late``.
+        Tokens are popped before use so every path remains single-use.
+        """
         entry = self._reply_tokens.pop(chat_id, None)
         if not entry:
-            return "", False
+            return "", ""
         token, expires_at = entry
-        if not token or time.time() >= expires_at:
-            return "", False
-        return token, True
+        if not token:
+            return "", ""
+        if time.time() < expires_at:
+            return token, "reply"
+        if allow_late:
+            return token, "reply-late"
+        return "", ""
+
+    def _reply_only_push_policy(self) -> bool:
+        return self.push_policy == LINE_PUSH_POLICY_REPLY_ONLY
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Trigger LINE's loading-animation indicator (DM only)."""
@@ -2646,17 +2713,28 @@ class LineAdapter(BasePlatformAdapter):
         first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
         rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
 
-        # First batch: try reply token, fall back to push.
-        token, used_reply = self._consume_reply_token(chat_id)
-        if used_reply:
+        # First batch: try reply token, fall back to push unless reply_only parks.
+        token, reply_kind = self._take_reply_token(
+            chat_id,
+            allow_late=self._reply_only_push_policy(),
+        )
+        if reply_kind:
             # Helper caps the merged batch at LINE's 5-per-call limit.
             first_batch = self._merge_parked_for_reply(chat_id, first_batch)
-        logger.info("LINE SEND site=prebuilt kind=%s chat=%s n=%d", "reply" if used_reply else "push", chat_id, len(first_batch) + len(rest))
-        if used_reply:
+        send_kind = reply_kind or ("park" if self._reply_only_push_policy() else "push")
+        logger.info(
+            "LINE SEND site=prebuilt kind=%s chat=%s n=%d",
+            send_kind, chat_id, len(first_batch) + len(rest),
+        )
+        if reply_kind:
             try:
                 response = await self._client.reply(token, first_batch)
                 self._remember_sent_message_texts(chat_id, response, first_batch)
             except Exception as exc:
+                if self._reply_only_push_policy():
+                    logger.info("LINE: reply token rejected (%s); parking without push", exc)
+                    self._park_for_quota(chat_id, first_batch + rest, reason="reply_only")
+                    return SendResult(success=True, message_id=None)
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
                     response = await self._client.push(chat_id, first_batch)
@@ -2667,6 +2745,9 @@ class LineAdapter(BasePlatformAdapter):
                         return SendResult(success=True, message_id=None)
                     return SendResult(success=False, error=str(exc2))
         else:
+            if self._reply_only_push_policy():
+                self._park_for_quota(chat_id, first_batch + rest, reason="reply_only")
+                return SendResult(success=True, message_id=None)
             try:
                 response = await self._client.push(chat_id, first_batch)
                 self._remember_sent_message_texts(chat_id, response, first_batch)
@@ -2675,6 +2756,10 @@ class LineAdapter(BasePlatformAdapter):
                     self._park_for_quota(chat_id, first_batch + rest)
                     return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error=str(exc))
+
+        if self._reply_only_push_policy() and rest:
+            self._park_for_quota(chat_id, rest, reason="reply_only")
+            return SendResult(success=True, message_id=None)
 
         # Subsequent batches: always push (reply token is single-use).
         while rest:

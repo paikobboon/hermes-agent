@@ -29,6 +29,12 @@ Below: the original pre-migration per-delta ledger, retained for lineage (anchor
 > Upstream is fetch-only: push URLs on `origin` are deliberately dead, and
 > `gh pr/issue create` + `*nousresearch*` are deny-listed in every profile.
 
+## Deltas (2026-07-15 — LINE reply-only conversation lane)
+
+| Commit | What | Re-apply anchor | Pinning test |
+|---|---|---|---|
+| `local` | `line-push-policy-reply-only` — owner ratified a reply-token-only LINE gateway conversation lane on 2026-07-15 after July quota exhaustion. LINE reply tokens are single-use and only have an approximately 1 minute guaranteed window, so gateway sends can now set `push_policy=reply_only` to never call the push API: fresh tokens reply normally; locally expired but unused tokens get one optimistic `kind=reply-late` attempt; failures/no-token park through the existing cap-10 per-chat park-and-flush buffer and flush on the next fresh token. Default `allow` preserves upstream reply→push behavior, and `_standalone_send` / `hermes send` still pushes because detached proactive sends have no reply token. Config surface: `LINE_PUSH_POLICY` env > `gateway.platforms.line.extra.push_policy` > `allow`. | send-decision sites in `plugins/platforms/line/adapter.py`: `_send_text_chunks`, `_send_messages`, `_take_reply_token`, `LINE_PUSH_POLICY_REPLY_ONLY` | `tests/gateway/test_line_plugin.py::TestReplyOnlyPushPolicy` (no-token park/no push; expired-unused 400 parks/no push; expired-unused success delivers/no park; already-used token parks/no late attempt; default `allow` still pushes; `_standalone_send` still pushes under `reply_only`) |
+
 ## Deltas (2026-07-13 — quota park-and-flush)
 
 | Commit | What | Re-apply anchor | Pinning test |

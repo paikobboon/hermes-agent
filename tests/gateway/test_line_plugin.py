@@ -590,6 +590,110 @@ class TestSendRouting:
         assert "malformed STICKER marker" in caplog.text
 
 
+class TestReplyOnlyPushPolicy:
+    """FORK DELTA 2026-07-15: gateway sends can be reply-token-only."""
+
+    def _adapter(self, *, extra=None):
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            **(extra or {}),
+        })
+        ad = LineAdapter(cfg)
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        return ad
+
+    def test_reply_only_no_token_parks_without_push(self):
+        ad = self._adapter(extra={"push_policy": "reply_only"})
+
+        result = asyncio.run(ad.send("C1", "hello family"))
+
+        assert result.success
+        assert [m["text"] for m in ad._quota_parked["C1"]] == ["hello family"]
+        ad._client.reply.assert_not_called()
+        ad._client.push.assert_not_called()
+
+    def test_reply_only_expired_unused_token_attempts_late_then_parks_on_400(self):
+        ad = self._adapter(extra={"push_policy": "reply_only"})
+        ad._reply_tokens["C1"] = ("late-token", time.time() - 5)
+        ad._client.reply = AsyncMock(
+            side_effect=RuntimeError('LINE reply 400: {"message":"Invalid reply token"}')
+        )
+
+        result = asyncio.run(ad.send("C1", "late hello"))
+
+        assert result.success
+        ad._client.reply.assert_awaited_once()
+        token, messages = ad._client.reply.await_args.args
+        assert token == "late-token"
+        assert [m["text"] for m in messages] == ["late hello"]
+        assert [m["text"] for m in ad._quota_parked["C1"]] == ["late hello"]
+        ad._client.push.assert_not_called()
+
+    def test_reply_only_expired_unused_token_success_delivers_without_parking(self):
+        ad = self._adapter(extra={"push_policy": "reply_only"})
+        ad._reply_tokens["C1"] = ("late-token", time.time() - 5)
+
+        result = asyncio.run(ad.send("C1", "late hello"))
+
+        assert result.success
+        ad._client.reply.assert_awaited_once()
+        assert ad._client.reply.await_args.args[0] == "late-token"
+        assert "C1" not in ad._quota_parked
+        ad._client.push.assert_not_called()
+
+    def test_reply_only_token_already_used_parks_without_late_attempt(self):
+        ad = self._adapter(extra={"push_policy": "reply_only"})
+        ad._reply_tokens["C1"] = ("used-token", time.time() + 30)
+        token, used = ad._consume_reply_token("C1")
+        assert (token, used) == ("used-token", True)
+
+        result = asyncio.run(ad.send("C1", "after button"))
+
+        assert result.success
+        ad._client.reply.assert_not_called()
+        ad._client.push.assert_not_called()
+        assert [m["text"] for m in ad._quota_parked["C1"]] == ["after button"]
+
+    def test_default_allow_push_fallback_still_pushes(self):
+        ad = self._adapter()
+
+        result = asyncio.run(ad.send("C1", "hello family"))
+
+        assert result.success
+        ad._client.push.assert_awaited_once()
+        ad._client.reply.assert_not_called()
+        assert "C1" not in ad._quota_parked
+
+    def test_standalone_send_still_pushes_under_reply_only(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        push_calls = []
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def push(self, chat_id, messages):
+                push_calls.append((chat_id, messages))
+
+        monkeypatch.setattr(_line, "_LineClient", _FakeClient)
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"channel_access_token": "tok", "push_policy": "reply_only"},
+        )
+
+        result = asyncio.run(_standalone_send(cfg, "Uchat", "hello"))
+
+        assert result.get("success") is True
+        assert len(push_calls) == 1
+        assert push_calls[0][0] == "Uchat"
+
+
 class TestQuoteContext:
 
     @pytest.fixture
